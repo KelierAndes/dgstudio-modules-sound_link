@@ -70,7 +70,6 @@ class SoundConfig(dict):
         "min_hz": 20.0,
         "max_hz": 2000.0,
         "mappings": [],
-        "outputs": [],
     }
 
     def __init__(self, data: dict | None = None, defaults: dict | None = None):
@@ -256,7 +255,6 @@ class SoundBridge:
         if first:
             self.engine.armed = False
         self.engine.set_mappings(self._effective_rows())
-        self.engine.set_outputs(self.config.get("outputs") or [])
         if first:
             self.engine.armed = True
             self._primed = True

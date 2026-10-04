@@ -10,10 +10,10 @@ config/sound_link.json 时自动补齐缺省，联动页据此渲染映射表与
 META = {
     "id": "sound_link",
     "name": "音频联动",
-    "version": "0.2.0",
-    "description": "采集麦克风/系统声音，实时输出左/右响度与左/右频率四个映射"
-                   "变量；每 0.1 秒把频率推入核心「外部脉冲流」波形，让输出"
-                   "频率跟随声音音高、电平跟随响度。",
+    "version": "0.2.1",
+    "description": "纯输入联动：采集麦克风/系统声音，实时输出左/右响度与左/右"
+                   "频率四个映射变量；每 0.1 秒把频率推入核心「外部脉冲流」"
+                   "波形，让输出频率跟随声音音高、电平跟随响度。",
     "settings_key": "sound_link",
     "default_enabled": False,
     "params": {
@@ -86,12 +86,6 @@ META = {
             "desc": "行 {param: 核心输入参数, expr: 表达式}，表达式以 "
                     "{left_loudness} 等引用音频变量，可混合核心输出参数，"
                     "结果取整钳制后派发；表留空用默认行（响度×2 驱动强度）",
-        },
-        "outputs": {
-            "label": "输出映射表", "type": "list", "default": [],
-            "group": "map", "rows": "out",
-            "desc": "行 {param: 核心输出参数, name: 字段名, expr: 表达式}"
-                    "（本模块无回传通道，仅用于联动页表达式调试）",
         },
     },
 }

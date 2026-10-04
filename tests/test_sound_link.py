@@ -266,20 +266,20 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "sound_link")
         self.assertEqual(meta["settings_key"], "sound_link")
-        self.assertEqual(meta["version"], "0.2.0")
+        self.assertEqual(meta["version"], "0.2.1")
         # 四个映射变量与 bridge PARAM_DEFS 一致
         self.assertEqual(set(meta["params"]), set(PARAM_DEFS))
         self.assertEqual(set(meta["params"]),
                          {"left_loudness", "right_loudness",
                           "left_frequency", "right_frequency"})
-        # 配置声明：设备键 + 左右交换 + 两张映射表
+        # 配置声明：设备键 + 左右交换 + 输入映射表；纯输入模块无输出映射表
         cfg = meta["config"]
         self.assertIn("microphone", cfg)
         self.assertIn("speaker", cfg)
         self.assertIn("swap_channels", cfg)
         self.assertNotIn("device", cfg)          # 旧键已由两个设备键取代
+        self.assertNotIn("outputs", cfg)         # 纯输入设计：无回传通道
         self.assertEqual(cfg["mappings"].get("rows"), "in")
-        self.assertEqual(cfg["outputs"].get("rows"), "out")
 
     def test_config_spec_scans_devices_into_choices(self):
         from modules.sound_link import bridge as bridge_mod
