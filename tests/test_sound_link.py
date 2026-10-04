@@ -81,12 +81,12 @@ class FakeCommands:
             pass
         return _noop()
 
-    def fire_start(self, slot_id=None):
+    def fire_start(self, slot_id=None, channel=None):
         async def _noop():
             pass
         return _noop()
 
-    def fire_stop(self, slot_id=None):
+    def fire_stop(self, slot_id=None, channel=None):
         async def _noop():
             pass
         return _noop()
@@ -266,7 +266,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "sound_link")
         self.assertEqual(meta["settings_key"], "sound_link")
-        self.assertEqual(meta["version"], "0.2.1")
+        self.assertEqual(meta["version"], "0.2.2")
         # 四个映射变量与 bridge PARAM_DEFS 一致
         self.assertEqual(set(meta["params"]), set(PARAM_DEFS))
         self.assertEqual(set(meta["params"]),
