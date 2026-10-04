@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# 运行时产物（模块设置在应用目录 config/，不随仓库）
+config/
+*.log
+
+# 开发遗留
+_ref/

@@ -1,0 +1,154 @@
+"""音频联动模块：把桥接器以外部模块形式接入宿主。
+
+模块实时维护四个映射变量（左响度 / 右响度 / 左频率 / 右频率），供核心
+输入映射表以 ``{变量}`` 引用驱动设备；同时每 0.1 秒把左/右频率推入核心
+「外部脉冲流」波形（控制页波形选择中的选项），由核心按推入数据逐帧生成
+波形，替代内置波形发生器。META["config"] 声明全部配置项，宿主装载
+config/sound_link.json 时自动补齐缺省，联动页据此渲染映射表与模块设置。
+"""
+
+META = {
+    "id": "sound_link",
+    "name": "音频联动",
+    "version": "0.1.0",
+    "description": "采集麦克风/系统声音，实时输出左/右响度与左/右频率四个映射"
+                   "变量；每 0.1 秒把频率推入核心「外部脉冲流」波形，让输出"
+                   "频率跟随声音音高、电平跟随响度。",
+    "settings_key": "sound_link",
+    "default_enabled": False,
+    "params": {
+        "left_loudness": {"label": "左响度", "desc": "左声道响度 0-100"},
+        "right_loudness": {"label": "右响度", "desc": "右声道响度 0-100"},
+        "left_frequency": {"label": "左频率", "desc": "左声道主频率 (Hz)"},
+        "right_frequency": {"label": "右频率", "desc": "右声道主频率 (Hz)"},
+    },
+    "config": {
+        # ---- 音频采集（来源/设备改动后重新开关模块生效） ----
+        "source": {
+            "label": "声音来源", "type": "choice",
+            "choices": ["microphone", "loopback"], "default": "microphone",
+            "group": "audio",
+            "desc": "microphone=麦克风输入；loopback=系统正在播放的声音"
+                    "（Windows WASAPI 回环，来源/设备改动后重新开关模块生效）",
+        },
+        "device": {
+            "label": "音频设备", "type": "str", "default": "",
+            "group": "audio",
+            "desc": "设备名称包含匹配（留空用系统默认；loopback 匹配播放设备）",
+        },
+        "gain": {
+            "label": "响度增益", "type": "float", "default": 1.0,
+            "min": 0.1, "max": 20.0, "step": 0.1, "group": "audio",
+            "desc": "dB 映射前乘系数，声音偏小可调大",
+        },
+        "min_db": {
+            "label": "响度 0% (dBFS)", "type": "float", "default": -60.0,
+            "min": -90.0, "max": -1.0, "step": 1.0, "group": "audio",
+            "desc": "低于该 RMS 电平响度记 0",
+        },
+        "max_db": {
+            "label": "响度 100% (dBFS)", "type": "float", "default": -10.0,
+            "min": -60.0, "max": 0.0, "step": 1.0, "group": "audio",
+            "desc": "高于该 RMS 电平响度记 100",
+        },
+        "smooth": {
+            "label": "响度平滑", "type": "float", "default": 0.5,
+            "min": 0.0, "max": 0.95, "step": 0.05, "group": "audio",
+            "desc": "指数平滑系数，越大越稳（0 关闭平滑）",
+        },
+        "min_hz": {
+            "label": "音高下限 (Hz)", "type": "float", "default": 20.0,
+            "min": 10.0, "max": 500.0, "step": 5.0, "group": "audio",
+            "desc": "检测下限，映射到设备频率 10（对数刻度）",
+        },
+        "max_hz": {
+            "label": "音高上限 (Hz)", "type": "float", "default": 2000.0,
+            "min": 100.0, "max": 8000.0, "step": 50.0, "group": "audio",
+            "desc": "检测上限，映射到设备频率 1000（对数刻度）",
+        },
+        # ---- 两张映射表（配置文件只写这些） ----
+        "mappings": {
+            "label": "输入映射表", "type": "list", "default": [],
+            "group": "map", "rows": "in",
+            "desc": "行 {param: 核心输入参数, expr: 表达式}，表达式以 "
+                    "{left_loudness} 等引用音频变量，可混合核心输出参数，"
+                    "结果取整钳制后派发；表留空用默认行（响度×2 驱动强度）",
+        },
+        "outputs": {
+            "label": "输出映射表", "type": "list", "default": [],
+            "group": "map", "rows": "out",
+            "desc": "行 {param: 核心输出参数, name: 字段名, expr: 表达式}"
+                    "（本模块无回传通道，仅用于联动页表达式调试）",
+        },
+    },
+}
+
+from plugins import ModuleBase, spec_defaults
+
+from modules.sound_link.bridge import PARAM_DEFS, SoundBridge, SoundConfig
+
+# 配置缺省值唯一来源 = META["config"] 声明，SoundConfig 仅做兜底
+SOUND_CONFIG_DEFAULTS = spec_defaults(META["config"])
+
+
+class SoundLinkModule(ModuleBase):
+    id = META["id"]
+    name = META["name"]
+    version = META["version"]
+    description = META["description"]
+    settings_key = META["settings_key"]
+
+    def __init__(self):
+        self.bridge: SoundBridge | None = None
+        self.ctx = None
+
+    def config_spec(self) -> dict:
+        return META["config"]
+
+    def link_params(self) -> list[tuple[str, str]]:
+        """映射变量表（模块可写参数：左/右响度、左/右频率）。"""
+        return [(name, str(item.get("label") or ""))
+                for name, item in PARAM_DEFS.items()]
+
+    def on_load(self, ctx) -> None:
+        self.ctx = ctx
+
+    def on_unload(self) -> None:
+        if self.bridge is not None:
+            self.bridge.close()
+        self.bridge = None
+        self.ctx = None
+
+    async def start(self) -> None:
+        if self.bridge is not None and self.bridge._running:
+            return
+        if self.bridge is not None:
+            try:
+                await self.bridge.stop()
+            except Exception:
+                pass
+        self.bridge = SoundBridge(
+            SoundConfig(self.ctx.settings, defaults=SOUND_CONFIG_DEFAULTS),
+            self.ctx.engine.get_state,
+            self.ctx.engine,
+            events=self.ctx.events,
+        )
+        self.bridge.log = self.ctx.log
+        await self.bridge.start()
+
+    async def reload_config(self) -> None:
+        """映射表编辑后立即重载；来源/设备变化由桥接器按签名重开输入流。"""
+        if self.bridge is None:
+            return
+        for key in SOUND_CONFIG_DEFAULTS:
+            if key in self.ctx.settings:
+                self.bridge.config[key] = self.ctx.settings[key]
+        await self.bridge.reload_config()
+
+    async def stop(self) -> None:
+        if self.bridge is not None:
+            await self.bridge.stop()
+
+    def is_running(self) -> bool:
+        return self.bridge is not None and bool(getattr(self.bridge,
+                                                        "_running", False))
