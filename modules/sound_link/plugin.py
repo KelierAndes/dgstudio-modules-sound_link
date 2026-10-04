@@ -10,7 +10,7 @@ config/sound_link.json 时自动补齐缺省，联动页据此渲染映射表与
 META = {
     "id": "sound_link",
     "name": "音频联动",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "description": "采集麦克风/系统声音，实时输出左/右响度与左/右频率四个映射"
                    "变量；每 0.1 秒把频率推入核心「外部脉冲流」波形，让输出"
                    "频率跟随声音音高、电平跟随响度。",
@@ -31,10 +31,23 @@ META = {
             "desc": "microphone=麦克风输入；loopback=系统正在播放的声音"
                     "（Windows WASAPI 回环，来源/设备改动后重新开关模块生效）",
         },
-        "device": {
-            "label": "音频设备", "type": "str", "default": "",
+        "microphone": {
+            "label": "麦克风设备", "type": "str", "default": "",
             "group": "audio",
-            "desc": "设备名称包含匹配（留空用系统默认；loopback 匹配播放设备）",
+            "desc": "设备名由模块自动扫描枚举（联动页为下拉选择框）；"
+                    "留空用系统默认录音设备",
+        },
+        "speaker": {
+            "label": "播放设备（回环）", "type": "str", "default": "",
+            "group": "audio",
+            "desc": "loopback 来源时回环采集的播放设备（自动枚举）；"
+                    "留空用系统默认播放设备",
+        },
+        "swap_channels": {
+            "label": "左右声道交换", "type": "bool", "default": False,
+            "group": "audio",
+            "desc": "默认采集声道0(左)→设备A通道、声道1(右)→设备B通道；"
+                    "开启后交换（左→B、右→A）",
         },
         "gain": {
             "label": "响度增益", "type": "float", "default": 1.0,
@@ -85,10 +98,18 @@ META = {
 
 from plugins import ModuleBase, spec_defaults
 
+from modules.sound_link import bridge as _bridge_mod
 from modules.sound_link.bridge import PARAM_DEFS, SoundBridge, SoundConfig
 
 # 配置缺省值唯一来源 = META["config"] 声明，SoundConfig 仅做兜底
 SOUND_CONFIG_DEFAULTS = spec_defaults(META["config"])
+
+# 设备配置键 → bridge 中的枚举函数名（config_spec 时经 getattr 惰性解析，
+# 便于测试替换枚举函数）
+_DEVICE_ENUMS = {
+    "microphone": "list_microphones",
+    "speaker": "list_speakers",
+}
 
 
 class SoundLinkModule(ModuleBase):
@@ -103,7 +124,24 @@ class SoundLinkModule(ModuleBase):
         self.ctx = None
 
     def config_spec(self) -> dict:
-        return META["config"]
+        """配置项声明（设备键动态转为下拉选择框）。
+
+        宿主渲染联动页设置区时按实例声明优先：麦克风/播放设备两项扫描
+        系统音频设备生成 choices，用户从下拉框选择绑定而非手填名称。
+        扫描失败（依赖未装/平台不支持）时 choices 只有「系统默认」。
+        """
+        spec = dict(META["config"])
+        for key, enum_name in _DEVICE_ENUMS.items():
+            item = dict(spec.get(key) or {})
+            names = []
+            try:
+                names = list(getattr(_bridge_mod, enum_name)())
+            except Exception:
+                names = []
+            item["type"] = "choice"
+            item["choices"] = [""] + list(names)
+            spec[key] = item
+        return spec
 
     def link_params(self) -> list[tuple[str, str]]:
         """映射变量表（模块可写参数：左/右响度、左/右频率）。"""

@@ -104,7 +104,7 @@ def _bridge(config: dict | None = None) -> tuple[SoundBridge, FakeCommands]:
                          commands)
     bridge.log = lambda msg: None
     bridge._stream = object()                      # 哨兵：跳过真实开流
-    bridge._stream_sig = bridge._stream_signature()
+    bridge._opened_sig = bridge._stream_signature()
     bridge._samplerate = SR
     return bridge, commands
 
@@ -236,6 +236,17 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bridge.engine.mappings.get("in_strength_a"),
                          "{left_loudness} * 3")
 
+    async def test_swap_channels_routes_device_channels(self):
+        bridge, _ = _bridge({"swap_channels": True})
+        bridge._blocks.append(_sine(0, amp=0.5, per_channel={0: 440.0, 1: 880.0}))
+        bridge._tick()
+        # 默认左声道→A；交换后左声道数据推入 B 通道（变量名仍按音频声道）
+        by_ch = {ch: f for f, ch, _lv in bridge.last_pushes}
+        self.assertEqual(by_ch["A"], hz_to_logical(880.0, 20.0, 2000.0))
+        self.assertEqual(by_ch["B"], hz_to_logical(440.0, 20.0, 2000.0))
+        self.assertAlmostEqual(bridge.engine.signals["left_frequency"], 440.0,
+                               delta=3.0)
+
 
 class PluginContractTests(unittest.TestCase):
     def _plugin_source(self) -> str:
@@ -255,14 +266,53 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "sound_link")
         self.assertEqual(meta["settings_key"], "sound_link")
+        self.assertEqual(meta["version"], "0.2.0")
         # 四个映射变量与 bridge PARAM_DEFS 一致
         self.assertEqual(set(meta["params"]), set(PARAM_DEFS))
         self.assertEqual(set(meta["params"]),
                          {"left_loudness", "right_loudness",
                           "left_frequency", "right_frequency"})
-        # 配置声明包含两张映射表
-        self.assertEqual(meta["config"]["mappings"].get("rows"), "in")
-        self.assertEqual(meta["config"]["outputs"].get("rows"), "out")
+        # 配置声明：设备键 + 左右交换 + 两张映射表
+        cfg = meta["config"]
+        self.assertIn("microphone", cfg)
+        self.assertIn("speaker", cfg)
+        self.assertIn("swap_channels", cfg)
+        self.assertNotIn("device", cfg)          # 旧键已由两个设备键取代
+        self.assertEqual(cfg["mappings"].get("rows"), "in")
+        self.assertEqual(cfg["outputs"].get("rows"), "out")
+
+    def test_config_spec_scans_devices_into_choices(self):
+        from modules.sound_link import bridge as bridge_mod
+
+        module = SoundLinkModule()
+        spec = module.config_spec()
+        # 未打补丁时依赖真实扫描：类型应为 choice 且首项为系统默认
+        self.assertEqual(spec["microphone"]["type"], "choice")
+        self.assertEqual(spec["speaker"]["type"], "choice")
+        self.assertEqual(spec["microphone"]["choices"][0], "")
+        self.assertEqual(spec["speaker"]["choices"][0], "")
+
+        # 打补丁模拟扫描结果：choices = 系统默认 + 枚举设备名
+        orig_mic, orig_spk = bridge_mod.list_microphones, bridge_mod.list_speakers
+        try:
+            bridge_mod.list_microphones = lambda: ["阵列麦克风 (AMD Audio Device)",
+                                                   "麦克风 (PicoStreamingMicrophone)"]
+            bridge_mod.list_speakers = lambda: ["扬声器 (Realtek(R) Audio)"]
+            spec = module.config_spec()
+            self.assertEqual(spec["microphone"]["choices"],
+                             ["", "阵列麦克风 (AMD Audio Device)",
+                              "麦克风 (PicoStreamingMicrophone)"])
+            self.assertEqual(spec["speaker"]["choices"],
+                             ["", "扬声器 (Realtek(R) Audio)"])
+        finally:
+            bridge_mod.list_microphones = orig_mic
+            bridge_mod.list_speakers = orig_spk
+
+    def test_bound_name_prefers_source_key_over_legacy(self):
+        bridge, _ = _bridge({"microphone": "阵列麦克风", "device": "旧值"})
+        self.assertEqual(bridge._bound_name(), "阵列麦克风")
+        bridge2, _ = _bridge({"source": "loopback", "speaker": "", "device": "旧值"})
+        self.assertEqual(bridge2._bound_name(), "旧值")
 
     def test_link_params_returns_four_variables(self):
         module = SoundLinkModule()

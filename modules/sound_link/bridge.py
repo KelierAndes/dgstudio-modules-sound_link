@@ -28,9 +28,10 @@ from dglab.params import (build_dispatchers, core_alias_values, core_inputs,
 from dglab.state import family_of
 from dglab.waves import PULSE_STREAM
 
-__all__ = ["SoundBridge", "SoundConfig", "PARAM_DEFS",
+__all__ = ["SoundBridge", "SoundConfig", "PARAM_DEFS", "DEFAULT_MAPPINGS",
+           "list_microphones", "list_speakers",
            "rms_dbfs", "dbfs_to_level", "dominant_frequency",
-           "hz_to_logical", "DEFAULT_MAPPINGS"]
+           "hz_to_logical"]
 
 # 分析与推流节奏：0.1s 一拍，一拍一帧（核心脉冲帧 = 100ms）
 TICK_S = 0.1
@@ -59,7 +60,9 @@ class SoundConfig(dict):
 
     DEFAULTS = {
         "source": "microphone",
-        "device": "",
+        "microphone": "",
+        "speaker": "",
+        "swap_channels": False,
         "gain": 1.0,
         "min_db": -60.0,
         "max_db": -10.0,
@@ -75,6 +78,69 @@ class SoundConfig(dict):
                           (defaults or self.DEFAULTS).items()})
         if data:
             self.update({k: v for k, v in data.items() if v is not None})
+
+
+# ---------------------------------------------------------------- 设备枚举
+
+def _wasapi_api_index(sd) -> int | None:
+    """Windows WASAPI 宿主 API 序号（sounddevice 设备条目按宿主 API 重复出现，
+    只有 WASAPI 条目支持回环与原生混音格式，其余为兼容条目）。"""
+    try:
+        for i, api in enumerate(sd.query_hostapis()):
+            if "wasapi" in str(api.get("name") or "").lower():
+                return i
+    except Exception:
+        pass
+    return None
+
+
+def list_microphones() -> list[str]:
+    """枚举录音设备名（仅 WASAPI 条目，sounddevice 不可用时返回空表）。"""
+    try:
+        import sounddevice as sd
+    except Exception:
+        return []
+    try:
+        wasapi = _wasapi_api_index(sd)
+        out: list[str] = []
+        for dev in sd.query_devices():
+            if int(dev.get("max_input_channels") or 0) <= 0:
+                continue
+            if wasapi is not None and dev.get("hostapi") != wasapi:
+                continue
+            name = str(dev.get("name") or "").strip()
+            if name and name not in out:
+                out.append(name)
+        return out
+    except Exception:
+        return []
+
+
+def list_speakers() -> list[str]:
+    """枚举可回环采集的播放设备名（WASAPI loopback，不可用时返回空表）。"""
+    try:
+        import pyaudiowpatch as pyaudio
+    except Exception:
+        return []
+    pa = None
+    try:
+        pa = pyaudio.PyAudio()
+        out: list[str] = []
+        for dev in pa.get_loopback_device_info_generator():
+            name = str(dev.get("name") or "").strip()
+            if name.endswith(" [Loopback]"):
+                name = name[: -len(" [Loopback]")]
+            if name and name not in out:
+                out.append(name)
+        return out
+    except Exception:
+        return []
+    finally:
+        if pa is not None:
+            try:
+                pa.terminate()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------- 纯分析函数
@@ -158,7 +224,9 @@ class SoundBridge:
         self._task: asyncio.Task | None = None
 
         # 音频采集状态（回调线程只 append 块副本，分析在引擎循环完成）
-        self._stream: Any = None
+        self._stream: Any = None            # sounddevice InputStream（麦克风）
+        self._pa: Any = None                # pyaudiowpatch（系统声音回环）
+        self._pa_stream: Any = None
         self._opened_sig: tuple | None = None   # 当前输入流对应的 (来源, 设备)
         self._blocks: deque[np.ndarray] = deque(maxlen=64)
         self._samplerate = 48000.0
@@ -307,82 +375,170 @@ class SoundBridge:
 
     def _stream_signature(self) -> tuple:
         return (str(self.config.get("source") or "microphone"),
+                str(self.config.get("microphone") or ""),
+                str(self.config.get("speaker") or ""),
                 str(self.config.get("device") or ""))
 
     def _ensure_stream(self) -> None:
         """按当前配置确保输入流可用（来源/设备变化时重开；失败退避重试）。"""
         sig = self._stream_signature()
-        if self._stream is not None and sig == self._opened_sig:
-            return
-        if self._stream is not None:
+        if self._stream is not None or self._pa_stream is not None:
+            if sig == self._opened_sig:
+                return
             self._close_stream()
         try:
-            self._open_stream()
+            if str(self.config.get("source")) == "loopback":
+                self._open_loopback()
+            else:
+                self._open_microphone()
             self._opened_sig = sig
             self._last_open_error = None
         except Exception as exc:
-            self._stream = None
+            self._close_stream()
             now = time.monotonic()
             if self._last_open_error is None or now - self._last_open_error[0] > 5.0:
                 self._last_open_error = (now, str(exc))
                 self.log(f"音频输入流打开失败（5 秒后自动重试）: {exc}")
             self._opened_sig = None
 
-    def _resolve_device(self):
-        """按配置挑设备：loopback 用播放设备（WASAPI 回环），否则录音设备。
+    def _bound_name(self) -> str:
+        """用户绑定的设备名：来源对应的新配置键优先，旧版 device 键兜底。"""
+        source = str(self.config.get("source") or "microphone")
+        key = "speaker" if source == "loopback" else "microphone"
+        return (str(self.config.get(key) or "").strip()
+                or str(self.config.get("device") or "").strip())
 
-        ``device`` 留空用系统默认；填名称子串则匹配第一个包含它的设备。
-        返回 (设备序号, 设备信息) 或 (None, None)。
-        """
+    def _open_microphone(self) -> None:
+        """麦克风路径：sounddevice 输入流（绑定 WASAPI 宿主 API 条目）。"""
         import sounddevice as sd
 
-        loopback = str(self.config.get("source")) == "loopback"
-        needle = str(self.config.get("device") or "").strip().lower()
-        default_in, default_out = sd.default.device
-        for idx, dev in enumerate(sd.query_devices()):
-            max_in = int(dev.get("max_input_channels") or 0)
-            max_out = int(dev.get("max_output_channels") or 0)
-            channels = max_out if loopback else max_in
-            if channels <= 0:
-                continue
-            if not needle:
-                if loopback and idx != default_out:
-                    continue
-                if not loopback and idx != default_in:
-                    continue
-            elif needle not in str(dev.get("name") or "").lower():
-                continue
-            return idx, dev
-        return None, None
-
-    def _open_stream(self) -> None:
-        import sounddevice as sd
-
-        idx, dev = self._resolve_device()
+        idx, dev = self._resolve_microphone(sd)
         if idx is None:
-            raise RuntimeError("未找到匹配的音频设备（检查「声音来源/音频设备」设置）")
-        loopback = str(self.config.get("source")) == "loopback"
-        max_channels = int(dev.get("max_output_channels" if loopback
-                                   else "max_input_channels") or 0)
-        self._channels = max(1, min(2, max_channels))
+            raise RuntimeError("未找到匹配的录音设备（检查「麦克风设备」设置）")
+        max_in = int(dev.get("max_input_channels") or 0)
+        self._channels = max(1, min(2, max_in))
         self._samplerate = float(dev.get("default_samplerate") or 48000.0)
-        extra = None
-        if loopback:
-            try:
-                extra = sd.WasapiSettings(loopback=True)
-            except (AttributeError, TypeError) as exc:
-                raise RuntimeError(f"当前平台不支持 WASAPI 回环采集: {exc}") from None
         self._stream = sd.InputStream(
             samplerate=self._samplerate, channels=self._channels, device=idx,
             blocksize=0, dtype="float32", callback=self._on_audio,
-            extra_settings=extra,
         )
         self._stream.start()
-        self.log(f"音频输入已打开: {dev.get('name')} "
-                 f"({self._samplerate:.0f} Hz × {self._channels} 声道"
-                 f"{'，WASAPI 回环' if loopback else ''})")
+        self._log_bound(str(dev.get("name") or idx))
+
+    def _resolve_microphone(self, sd):
+        """按配置挑录音设备：空绑定用系统默认，否则精确名 → 子串包含匹配。
+
+        设备条目在 Windows 下按宿主 API（MME/DirectSound/WASAPI/…）重复出现，
+        一律优先 WASAPI 条目（原生混音格式、支持后续回环扩展）。返回
+        (设备序号, 设备信息) 或 (None, None)。
+        """
+        name = self._bound_name()
+        devices = sd.query_devices()
+        wasapi = _wasapi_api_index(sd)
+        default_idx = None
+        if wasapi is not None:
+            hostapis = sd.query_hostapis()
+            default_idx = int(hostapis[wasapi].get("default_input_device") or -1)
+
+        candidates: list[tuple[bool, int, dict]] = []
+        for idx, dev in enumerate(devices):
+            if int(dev.get("max_input_channels") or 0) <= 0:
+                continue
+            candidates.append((dev.get("hostapi") == wasapi, idx, dev))
+        if not candidates:
+            return None, None
+        # WASAPI 条目排前（稳定排序保持同 API 内的枚举顺序）
+        candidates.sort(key=lambda c: not c[0])
+
+        if not name:
+            if default_idx is not None and default_idx >= 0:
+                return default_idx, devices[default_idx]
+            return candidates[0][1], candidates[0][2]
+
+        for match in (lambda n: n == name, lambda n: name in n):
+            for _preferred, idx, dev in candidates:
+                if match(str(dev.get("name") or "")):
+                    return idx, dev
+        raise RuntimeError(f"未找到匹配「{name}」的录音设备")
+
+    def _resolve_loopback_device(self, pa, name: str):
+        """挑回环设备：空绑定用系统默认播放设备的回环端点，否则子串匹配。"""
+        import pyaudiowpatch as pyaudio
+
+        loopbacks = list(pa.get_loopback_device_info_generator())
+        if not loopbacks:
+            raise RuntimeError("未枚举到任何可回环采集的播放设备")
+        if name:
+            for dev in loopbacks:
+                if name in str(dev.get("name") or ""):
+                    return dev
+            raise RuntimeError(f"未找到包含「{name}」的回环播放设备")
+        wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+        default_speakers = pa.get_device_info_by_index(
+            int(wasapi["defaultOutputDevice"]))
+        if default_speakers.get("isLoopbackDevice"):
+            return default_speakers
+        default_name = str(default_speakers.get("name") or "")
+        for dev in loopbacks:
+            if default_name and default_name in str(dev.get("name") or ""):
+                return dev
+        return loopbacks[0]
+
+    def _open_loopback(self) -> None:
+        """系统声音路径：pyaudiowpatch 对播放设备的 WASAPI 回环端点开输入流。
+
+        sounddevice 自带的 PortAudio 构建未暴露回环端点（渲染设备输入
+        通道数为 0，输入流/全双工都开不了），系统声音采集必须走本路径。
+        """
+        import pyaudiowpatch as pyaudio
+
+        pa = pyaudio.PyAudio()
+        try:
+            target = self._resolve_loopback_device(pa, self._bound_name())
+            channels = max(1, int(target.get("maxInputChannels") or 2))
+            rate = int(target.get("defaultSampleRate") or 48000)
+            self._pa_stream = pa.open(
+                format=pyaudio.paFloat32, channels=channels, rate=rate,
+                input=True, input_device_index=int(target["index"]),
+                frames_per_buffer=int(rate * 0.04),
+                stream_callback=self._pa_callback,
+            )
+            self._pa_stream.start_stream()
+            self._pa = pa
+            self._channels = channels
+            self._samplerate = float(rate)
+            self._log_bound(str(target.get("name") or "系统默认播放设备"))
+        except Exception:
+            try:
+                pa.terminate()
+            except Exception:
+                pass
+            raise
+
+    def _log_bound(self, device_name: str) -> None:
+        swap = bool(self.config.get("swap_channels"))
+        source = str(self.config.get("source") or "microphone")
+        self.log(
+            f"音频输入已打开: {device_name} "
+            f"({self._samplerate:.0f} Hz × {self._channels} 声道，"
+            f"{'系统声音回环' if source == 'loopback' else '麦克风'}）\n"
+            f"声道绑定: 采集声道0 → 左 → 设备{'B' if swap else 'A'}通道；"
+            f"声道1 → 右 → 设备{'A' if swap else 'B'}通道")
 
     def _close_stream(self) -> None:
+        pa_stream, self._pa_stream = self._pa_stream, None
+        if pa_stream is not None:
+            try:
+                pa_stream.stop_stream()
+                pa_stream.close()
+            except Exception:
+                pass
+        pa, self._pa = self._pa, None
+        if pa is not None:
+            try:
+                pa.terminate()
+            except Exception:
+                pass
         stream, self._stream = self._stream, None
         if stream is None:
             return
@@ -397,6 +553,18 @@ class SoundBridge:
         if status:
             pass                     # overflow 等瞬时状态不处理，靠窗口截断兜底
         self._blocks.append(np.array(indata, copy=True))
+
+    def _pa_callback(self, indata, frame_count, time_info, status):
+        """pyaudiowpatch 回环回调（音频线程）：块拷贝入队。"""
+        try:
+            arr = np.frombuffer(indata, dtype=np.float32)
+            arr = arr.reshape(-1, self._channels) if self._channels > 1 \
+                else arr.reshape(-1, 1)
+            self._blocks.append(arr.copy())
+        except Exception:
+            pass
+        import pyaudiowpatch as pyaudio
+        return None, pyaudio.paContinue
 
     # ---- 分析与推流 -----------------------------------------------------
 
@@ -423,7 +591,7 @@ class SoundBridge:
         return window
 
     def _tick(self) -> None:
-        if self._stream is None:
+        if self._stream is None and self._pa_stream is None:
             self._ensure_stream()
         window = self._take_window()
         cfg = self.config
@@ -442,8 +610,12 @@ class SoundBridge:
                 selection = {}
 
         pushes: list[tuple[int, str, int]] = []
-        for side, channel in (("left", "A"), ("right", "B")):
-            column = self._channel_column(window, 0 if side == "left" else 1)
+        swap = bool(self.config.get("swap_channels"))
+        # 声道路由：默认 采集声道0(左)→设备A、声道1(右)→设备B；swap_channels 交换
+        for side, audio_col in (("left", 0), ("right", 1)):
+            channel = ("B" if swap else "A") if side == "left" \
+                else ("A" if swap else "B")
+            column = self._channel_column(window, audio_col)
             level_raw = dbfs_to_level(rms_dbfs(column) + gain_db,
                                       min_db, max_db)
             # 静音快切（不平滑，声音一停立即归零）；起音走指数平滑

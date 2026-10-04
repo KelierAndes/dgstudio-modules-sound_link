@@ -1,2 +1,3 @@
 numpy>=1.26
 sounddevice>=0.4.6
+pyaudiowpatch>=0.2.12.6; sys_platform == "win32"
