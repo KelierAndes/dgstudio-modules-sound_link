@@ -60,7 +60,8 @@ DGStudio 的音频联动模块：采集**麦克风**或**系统正在播放的�
         └─ 事件流周期卡（100ms，宿主 50ms 节拍驱动）
              left_pulse → in_pulse_a、right_pulse → in_pulse_b（核心输入参数）
                   └─► 核心派发器（0.1s 节流，0=静音帧）
-                        └─► 引擎 push_pulse_stream → 「外部脉冲流」波形逐帧成流
+                        └─► 引擎 push_pulse_stream → 以最新帧实时刷新
+                              「外部脉冲流」波形（输出频率即时跟随声音）
 ```
 
 - **频率→设备频率**：`[min_hz, max_hz]` 声音频带对数映射到设备逻辑频率
