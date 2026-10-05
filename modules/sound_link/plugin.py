@@ -1,19 +1,21 @@
 """音频联动模块：把桥接器以外部模块形式接入宿主。
 
-模块实时维护四个映射变量（左响度 / 右响度 / 左频率 / 右频率），供核心
-输入映射表以 ``{变量}`` 引用驱动设备；同时每 0.1 秒把左/右频率推入核心
-「外部脉冲流」波形（控制页波形选择中的选项），由核心按推入数据逐帧生成
-波形，替代内置波形发生器。META["config"] 声明全部配置项，宿主装载
-config/sound_link.json 时自动补齐缺省，联动页据此渲染映射表与模块设置。
+模块是**纯输入信号源**：每 0.1 秒采集分析一拍，把左/右响度、左/右频率与
+左/右推流值（静音=0，否则=主频映射到设备逻辑频率 10-1000）六个变量喂进
+映射引擎信号空间。设备动作全部由联动页的事件流驱动：默认事件卡（每 100ms
+周期）把推流值推入核心 ``in_pulse_a/b`` 参数——核心对脉冲流参数每拍生成
+一帧 100ms 脉冲（0=静音帧），通道波形选「外部脉冲流」即成流，替代内置
+波形发生器。事件流/临时变量表由宿主装载与节拍驱动（apply_logic_tables）。
+META["config"] 声明全部配置项，宿主装载 config/sound_link.json 时自动补齐。
 """
 
 META = {
     "id": "sound_link",
     "name": "音频联动",
-    "version": "0.2.2",
-    "description": "纯输入联动：采集麦克风/系统声音，实时输出左/右响度与左/右"
-                   "频率四个映射变量；每 0.1 秒把频率推入核心「外部脉冲流」"
-                   "波形，让输出频率跟随声音音高、电平跟随响度。",
+    "version": "0.3.0",
+    "description": "纯输入联动：采集麦克风/系统声音，实时输出左/右响度、"
+                   "左/右频率与左右推流值六个映射变量；事件流周期把推流值"
+                   "推入核心「外部脉冲流」参数，输出频率跟随声音音高。",
     "settings_key": "sound_link",
     "default_enabled": False,
     "params": {
@@ -21,6 +23,10 @@ META = {
         "right_loudness": {"label": "右响度", "desc": "右声道响度 0-100"},
         "left_frequency": {"label": "左频率", "desc": "左声道主频率 (Hz)"},
         "right_frequency": {"label": "右频率", "desc": "右声道主频率 (Hz)"},
+        "left_pulse": {"label": "左推流",
+                       "desc": "左声道推流值（静音=0，否则=设备逻辑频率）"},
+        "right_pulse": {"label": "右推流",
+                        "desc": "右声道推流值（静音=0，否则=设备逻辑频率）"},
     },
     "config": {
         # ---- 音频采集（来源/设备改动后重新开关模块生效） ----
@@ -46,8 +52,8 @@ META = {
         "swap_channels": {
             "label": "左右声道交换", "type": "bool", "default": False,
             "group": "audio",
-            "desc": "默认采集声道0(左)→设备A通道、声道1(右)→设备B通道；"
-                    "开启后交换（左→B、右→A）",
+            "desc": "默认采集声道0(物理左)→左变量、声道1(物理右)→右变量；"
+                    "开启后交换（现场左右接反时对调，设备侧绑定在事件流配置）",
         },
         "gain": {
             "label": "响度增益", "type": "float", "default": 1.0,
@@ -79,21 +85,14 @@ META = {
             "min": 100.0, "max": 8000.0, "step": 50.0, "group": "audio",
             "desc": "检测上限，映射到设备频率 1000（对数刻度）",
         },
-        # ---- 两张映射表（配置文件只写这些） ----
-        "mappings": {
-            "label": "输入映射表", "type": "list", "default": [],
-            "group": "map", "rows": "in",
-            "desc": "行 {param: 核心输入参数, expr: 表达式}，表达式以 "
-                    "{left_loudness} 等引用音频变量，可混合核心输出参数，"
-                    "结果取整钳制后派发；表留空用默认行（响度×2 驱动强度）",
-        },
     },
 }
 
 from plugins import ModuleBase, spec_defaults
 
 from modules.sound_link import bridge as _bridge_mod
-from modules.sound_link.bridge import PARAM_DEFS, SoundBridge, SoundConfig
+from modules.sound_link.bridge import (DEFAULT_EVENT_CARDS, PARAM_DEFS,
+                                       SoundBridge, SoundConfig)
 
 # 配置缺省值唯一来源 = META["config"] 声明，SoundConfig 仅做兜底
 SOUND_CONFIG_DEFAULTS = spec_defaults(META["config"])
@@ -138,12 +137,22 @@ class SoundLinkModule(ModuleBase):
         return spec
 
     def link_params(self) -> list[tuple[str, str]]:
-        """映射变量表（模块可写参数：左/右响度、左/右频率）。"""
+        """映射变量表（模块可写参数：响度/频率/推流值 × 左右声道）。"""
         return [(name, str(item.get("label") or ""))
                 for name, item in PARAM_DEFS.items()]
 
     def on_load(self, ctx) -> None:
         self.ctx = ctx
+        # 首次运行播种默认事件流卡片（此后 events 由用户在联动页编辑，
+        # 删除后不复活）；宿主 start/reload 时经 apply_logic_tables 装载
+        if "events" not in ctx.settings:
+            ctx.settings["events"] = [
+                {"name": card["name"], "trigger": card["trigger"],
+                 "arg": card["arg"],
+                 "actions": [dict(a) for a in card["actions"]]}
+                for card in DEFAULT_EVENT_CARDS]
+            ctx.log("已播种默认事件流：每 100ms 把左右推流值推入 "
+                    "in_pulse_a/b（联动页事件流可自行调整）")
 
     def on_unload(self) -> None:
         if self.bridge is not None:
@@ -169,13 +178,17 @@ class SoundLinkModule(ModuleBase):
         await self.bridge.start()
 
     async def reload_config(self) -> None:
-        """映射表编辑后立即重载；来源/设备变化由桥接器按签名重开输入流。"""
+        """联动页保存设置后由宿主调用：把设置同步进桥接器配置。
+
+        增益 / dB 上下限 / 平滑 / 音高上下限每拍读取配置即时生效；
+        来源/设备由桥接器按「已开流签名」自动重开。事件流/临时变量由
+        宿主在 reload 之后统一重载（apply_logic_tables）。
+        """
         if self.bridge is None:
             return
         for key in SOUND_CONFIG_DEFAULTS:
             if key in self.ctx.settings:
                 self.bridge.config[key] = self.ctx.settings[key]
-        await self.bridge.reload_config()
 
     async def stop(self) -> None:
         if self.bridge is not None:

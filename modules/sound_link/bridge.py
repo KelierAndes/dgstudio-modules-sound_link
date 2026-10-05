@@ -26,9 +26,8 @@ from dglab.mapping import MappingEngine
 from dglab.params import (build_dispatchers, core_alias_values, core_inputs,
                           device_state_values, input_ranges)
 from dglab.state import family_of
-from dglab.waves import PULSE_STREAM
 
-__all__ = ["SoundBridge", "SoundConfig", "PARAM_DEFS", "DEFAULT_MAPPINGS",
+__all__ = ["SoundBridge", "SoundConfig", "PARAM_DEFS", "DEFAULT_EVENT_CARDS",
            "list_microphones", "list_speakers",
            "rms_dbfs", "dbfs_to_level", "dominant_frequency",
            "hz_to_logical"]
@@ -37,21 +36,30 @@ __all__ = ["SoundBridge", "SoundConfig", "PARAM_DEFS", "DEFAULT_MAPPINGS",
 TICK_S = 0.1
 # 分析窗口上限（样本数）：防采集堆积时窗口无界增长
 MAX_WINDOW_SAMPLES = 8192
-# 响度低于该值（0-100 标尺）视为静音：频率沿用上一拍、脉冲电平推 0
+# 响度低于该值（0-100 标尺）视为静音：频率沿用上一拍、推流值归 0
 SILENCE_LEVEL = 1.0
 
-# 四个映射变量（META["params"] 的唯一来源，模块页实时数据区据此展示）
+# 六个映射变量（META["params"] 的唯一来源，联动页实时数据区据此展示）：
+# 响度/频率供映射与事件流表达式引用，推流值（静音=0，否则=主频）供
+# 周期事件推入核心 in_pulse_* 参数生成脉冲流
 PARAM_DEFS: dict[str, dict[str, str]] = {
     "left_loudness": {"label": "左响度", "desc": "左声道响度 0-100"},
     "right_loudness": {"label": "右响度", "desc": "右声道响度 0-100"},
     "left_frequency": {"label": "左频率", "desc": "左声道主频率 (Hz)"},
     "right_frequency": {"label": "右频率", "desc": "右声道主频率 (Hz)"},
+    "left_pulse": {"label": "左推流", "desc": "左声道推流值（静音=0，否则=主频）"},
+    "right_pulse": {"label": "右推流", "desc": "右声道推流值（静音=0，否则=主频）"},
 }
 
-# 映射表为空时的默认行：左/右响度直接驱动郊狼 A/B 强度（0-100 → 0-200）
-DEFAULT_MAPPINGS: list[dict[str, str]] = [
-    {"param": "in_strength_a", "expr": "{left_loudness} * 2"},
-    {"param": "in_strength_b", "expr": "{right_loudness} * 2"},
+# 首次运行播种的事件流卡片（settings["events"] 不存在时写入，此后由用户
+# 在联动页编辑）：每 100ms 把左右推流值推入核心脉冲流参数——核心对
+# in_pulse_* 每拍生成一帧 100ms 脉冲（0=静音帧），波形选「外部脉冲流」即成流
+DEFAULT_EVENT_CARDS: list[dict] = [
+    {"name": "音频脉冲流推入", "trigger": "period", "arg": 100,
+     "actions": [
+         {"dir": "in", "param": "in_pulse_a", "var": "left_pulse"},
+         {"dir": "in", "param": "in_pulse_b", "var": "right_pulse"},
+     ]},
 ]
 
 
@@ -69,7 +77,6 @@ class SoundConfig(dict):
         "smooth": 0.5,
         "min_hz": 20.0,
         "max_hz": 2000.0,
-        "mappings": [],
     }
 
     def __init__(self, data: dict | None = None, defaults: dict | None = None):
@@ -202,13 +209,17 @@ def hz_to_logical(hz: float, low_hz: float, high_hz: float) -> int:
 # ---------------------------------------------------------------- 桥接器
 
 class SoundBridge:
-    """音频采集与分析运行时：四个映射变量 + 外部脉冲流推流。
+    """音频采集与分析运行时：映射变量信号源 + 事件流驱动的脉冲流推帧。
 
-    :param config: 模块配置（SoundConfig，reload_config 时原位更新）
+    本模块是**纯输入信号源**：每 0.1s 分析一拍，把响度/频率/推流值喂进
+    映射引擎信号空间；设备动作全部由联动页配置的事件流（周期事件把
+    ``left_pulse``/``right_pulse`` 推入核心 ``in_pulse_*`` 参数等）与
+    临时变量表驱动，事件流由宿主节拍循环装载与驱动（apply_logic_tables）。
+
+    :param config: 模块配置（SoundConfig，联动页保存后经模块 reload_config 原位更新）
     :param get_state: 引擎状态回调（``ctx.engine.get_state``）
-    :param commands: 引擎命令层（``ctx.engine``，需要 wave_selection /
-                     push_pulse_stream / set_strength / set_wave 等）
-    :param events: 应用事件总线（可选，用于订阅 App 按键反馈）
+    :param commands: 引擎命令层（``ctx.engine``，需要 push_pulse_stream 等）
+    :param events: 应用事件总线（可选）
     """
 
     def __init__(self, config: SoundConfig, get_state: Callable[[], Any],
@@ -235,35 +246,15 @@ class SoundBridge:
         # 分析状态
         self._smoothed: dict[str, float] = {}
         self._last_freq: dict[str, float] = {"left": 0.0, "right": 0.0}
-        self.last_pushes: list[tuple[int, str, int]] = []
         self.last_values: dict[str, float] = {}
 
-        # 映射引擎：信号空间 = 音频变量 ∪ 核心输出参数实时值
+        # 映射引擎：信号空间 = 音频变量 ∪ 核心输出参数实时值 ∪ 临时变量；
+        # 事件流卡片由宿主装载并按 50ms 节拍驱动
         self.engine = MappingEngine(self._dispatch,
                                     device_vars=self._device_vars,
                                     ranges=input_ranges())
         self._api = self._DeviceApi(self)
         self.dispatchers = build_dispatchers(self._api, core_inputs())
-        self._primed = False
-        self.apply_config()
-
-    # ---- 映射表 ---------------------------------------------------------
-
-    def apply_config(self) -> None:
-        """装载映射表；首轮只静默求值，避免启动即把设备写成 0。"""
-        first = not self._primed
-        if first:
-            self.engine.armed = False
-        self.engine.set_mappings(self._effective_rows())
-        if first:
-            self.engine.armed = True
-            self._primed = True
-
-    def _effective_rows(self) -> list[dict]:
-        rows = [row for row in (self.config.get("mappings") or [])
-                if isinstance(row, dict)
-                and str(row.get("param") or "").strip()]
-        return rows or [dict(row) for row in DEFAULT_MAPPINGS]
 
     def _safe_state(self):
         try:
@@ -324,6 +315,11 @@ class SoundBridge:
         def set_wave(self, channel, name, slot_id=None):
             return self._cmd.set_wave(channel, name, slot_id=slot_id)
 
+        def push_pulse(self, channel, value, level=100, slot_id=None):
+            """脉冲流数值推入（in_pulse_* 派发）：值=设备逻辑频率。"""
+            return self._cmd.push_pulse_stream(value, channel=channel,
+                                               level=level, slot_id=slot_id)
+
         def zap(self, channel, seconds=1.0, slot_id=None):
             return self._cmd.zap(channel, seconds, slot_id=slot_id)
 
@@ -348,7 +344,8 @@ class SoundBridge:
         self._loop = asyncio.get_running_loop()
         self._opened_sig = None            # 强制本循环内打开设备
         self._task = asyncio.create_task(self._tick_loop())
-        self.log("音频联动已启动（每 0.1s 分析一拍：响度 / 频率 → 映射与脉冲流）")
+        self.log("音频联动已启动（每 0.1s 分析一拍：响度 / 频率 / 推流值 → "
+                 "信号空间；脉冲流由事件流周期卡推入 in_pulse_*）")
 
     async def stop(self) -> None:
         self._running = False
@@ -360,14 +357,6 @@ class SoundBridge:
 
     def close(self) -> None:
         """模块卸载清理（无事件订阅，仅占位与后续扩展）。"""
-
-    async def reload_config(self) -> None:
-        """联动页保存设置后由宿主调用：映射表热生效，来源/设备变化重开流。
-
-        增益 / dB 上下限 / 平滑 / 音高上下限每拍读取配置，无需特殊处理；
-        输入流按「已开流签名」比对——仅来源/设备真正变化才重开。
-        """
-        self.apply_config()
 
     # ---- 音频采集 -------------------------------------------------------
 
@@ -516,12 +505,14 @@ class SoundBridge:
     def _log_bound(self, device_name: str) -> None:
         swap = bool(self.config.get("swap_channels"))
         source = str(self.config.get("source") or "microphone")
+        lcol, rcol = (1, 0) if swap else (0, 1)
         self.log(
             f"音频输入已打开: {device_name} "
             f"({self._samplerate:.0f} Hz × {self._channels} 声道，"
             f"{'系统声音回环' if source == 'loopback' else '麦克风'}）\n"
-            f"声道绑定: 采集声道0 → 左 → 设备{'B' if swap else 'A'}通道；"
-            f"声道1 → 右 → 设备{'A' if swap else 'B'}通道")
+            f"声道绑定: 采集声道{lcol} → 左变量 left_*，声道{rcol} → 右变量 "
+            f"right_*；默认事件流把左右推流值推入设备 A/B 通道脉冲流"
+            f"（左右接反时开启「左右声道交换」对调）")
 
     def _close_stream(self) -> None:
         pa_stream, self._pa_stream = self._pa_stream, None
@@ -564,7 +555,7 @@ class SoundBridge:
         import pyaudiowpatch as pyaudio
         return None, pyaudio.paContinue
 
-    # ---- 分析与推流 -----------------------------------------------------
+    # ---- 分析节拍 -------------------------------------------------------
 
     async def _tick_loop(self) -> None:
         try:
@@ -599,20 +590,12 @@ class SoundBridge:
         smooth = max(0.0, min(0.95, float(cfg.get("smooth") or 0.0)))
         low_hz = max(1.0, float(cfg.get("min_hz") or 20.0))
         high_hz = max(low_hz * 2.0, float(cfg.get("max_hz") or 2000.0))
-        selection = {}
-        getter = getattr(self.commands, "wave_selection", None)
-        if getter is not None:
-            try:
-                selection = getter() or {}
-            except Exception:
-                selection = {}
 
-        pushes: list[tuple[int, str, int]] = []
         swap = bool(self.config.get("swap_channels"))
-        # 声道路由：默认 采集声道0(左)→设备A、声道1(右)→设备B；swap_channels 交换
-        for side, audio_col in (("left", 0), ("right", 1)):
-            channel = ("B" if swap else "A") if side == "left" \
-                else ("A" if swap else "B")
+        # 声道路由：默认采集声道0(物理左)→left_* 变量、声道1(物理右)→right_*；
+        # swap_channels 交换（现场左右接反时对调；设备侧绑定由事件流配置）
+        for side, audio_col in (("left", 1 if swap else 0),
+                                ("right", 0 if swap else 1)):
             column = self._channel_column(window, audio_col)
             level_raw = dbfs_to_level(rms_dbfs(column) + gain_db,
                                       min_db, max_db)
@@ -636,20 +619,15 @@ class SoundBridge:
 
             self.engine.signal(f"{side}_loudness", round(level, 1))
             self.engine.signal(f"{side}_frequency", round(freq, 1))
-
-            # 外部脉冲流：选中该通道波形时按拍推流（频率 + 响度电平）；
-            # 静音时电平推 0（该帧无声但保留频率成形）
-            if selection.get(channel) == PULSE_STREAM:
-                logical = hz_to_logical(freq or low_hz, low_hz, high_hz)
-                level_out = int(round(level))
-                pushes.append((logical, channel, level_out))
+            # 推流值（数值推入）：有声 = 主频对数映射到设备逻辑频率 10-1000，
+            # 静音 = 0——事件流周期卡把它推入 in_pulse_*，核心据此生成
+            # 一帧 100ms 脉冲（0 = 静音帧）
+            pulse = hz_to_logical(freq, low_hz, high_hz) \
+                if level >= SILENCE_LEVEL and freq > 0.0 else 0
+            self.engine.signal(f"{side}_pulse", pulse)
 
         self.last_values = {name: float(self.engine.signals.get(name, 0.0) or 0.0)
                             for name in PARAM_DEFS}
-        self.last_pushes = pushes
-        for logical, channel, level_out in pushes:
-            self._spawn(self.commands.push_pulse_stream(
-                logical, channel=channel, level=level_out))
 
     @staticmethod
     def _channel_column(window: np.ndarray | None, index: int) -> np.ndarray:
