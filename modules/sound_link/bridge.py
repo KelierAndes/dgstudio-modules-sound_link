@@ -320,6 +320,17 @@ class SoundBridge:
             return self._cmd.push_pulse_stream(value, channel=channel,
                                                level=level, slot_id=slot_id)
 
+        def pulse_level(self, channel: str) -> int:
+            """脉冲帧电平 = 该通道侧的当前响度（0-100，平滑后）。
+
+            核心派发器可选钩子：设备振动/波形包络跟随音频响度（静音帧由
+            推流值 0 语义单独处理为电平 0）。通道约定 A=左、B=右（与默认
+            事件卡的变量绑定一致）。
+            """
+            side = "left" if channel == "A" else "right"
+            level = self._b._smoothed.get(side, 0.0)
+            return max(0, min(100, int(round(level))))
+
         def zap(self, channel, seconds=1.0, slot_id=None):
             return self._cmd.zap(channel, seconds, slot_id=slot_id)
 

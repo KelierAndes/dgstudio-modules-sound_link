@@ -12,7 +12,7 @@ META["config"] 声明全部配置项，宿主装载 config/sound_link.json 时�
 META = {
     "id": "sound_link",
     "name": "音频联动",
-    "version": "0.3.0",
+    "version": "0.3.1",
     "description": "纯输入联动：采集麦克风/系统声音，实时输出左/右响度、"
                    "左/右频率与左右推流值六个映射变量；事件流周期把推流值"
                    "推入核心「外部脉冲流」参数，输出频率跟随声音音高。",

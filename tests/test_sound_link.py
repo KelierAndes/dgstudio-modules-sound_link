@@ -257,7 +257,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "sound_link")
         self.assertEqual(meta["settings_key"], "sound_link")
-        self.assertEqual(meta["version"], "0.3.0")
+        self.assertEqual(meta["version"], "0.3.1")
         # 六个映射变量与 bridge PARAM_DEFS 一致
         self.assertEqual(set(meta["params"]), set(PARAM_DEFS))
         self.assertEqual(set(meta["params"]),
