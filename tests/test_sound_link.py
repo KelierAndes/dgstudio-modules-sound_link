@@ -178,7 +178,7 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(level, 100.0)
             # 推流值 = 主频对数映射到设备逻辑频率
             self.assertEqual(bridge.engine.signals[f"{side}_pulse"],
-                             hz_to_logical(freq, 20.0, 2000.0))
+                             hz_to_logical(freq, 20.0, 1000.0))
         # 未配置事件流（宿主未装载卡片）时模块自身不推帧
         self.assertEqual(commands.pushed, [])
 
@@ -193,8 +193,8 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)                    # 让出节拍：推流协程执行
         self.assertEqual(len(commands.pushed), 2)
         by_ch = {ch: (f, lv) for f, ch, lv in commands.pushed}
-        self.assertEqual(by_ch["A"][0], hz_to_logical(440.0, 20.0, 2000.0))
-        self.assertEqual(by_ch["B"][0], hz_to_logical(880.0, 20.0, 2000.0))
+        self.assertEqual(by_ch["A"][0], hz_to_logical(440.0, 20.0, 1000.0))
+        self.assertEqual(by_ch["B"][0], hz_to_logical(880.0, 20.0, 1000.0))
         self.assertEqual(by_ch["A"][1], 100)      # 非静音帧电平 100
 
         # 恒定音：周期再次到期时同值也继续推帧（流语义，非边沿动作）
@@ -257,7 +257,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "sound_link")
         self.assertEqual(meta["settings_key"], "sound_link")
-        self.assertEqual(meta["version"], "0.3.1")
+        self.assertEqual(meta["version"], "0.3.2")
         # 六个映射变量与 bridge PARAM_DEFS 一致
         self.assertEqual(set(meta["params"]), set(PARAM_DEFS))
         self.assertEqual(set(meta["params"]),

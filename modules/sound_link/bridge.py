@@ -76,7 +76,7 @@ class SoundConfig(dict):
         "max_db": -10.0,
         "smooth": 0.5,
         "min_hz": 20.0,
-        "max_hz": 2000.0,
+        "max_hz": 1000.0,
     }
 
     def __init__(self, data: dict | None = None, defaults: dict | None = None):
@@ -288,6 +288,9 @@ class SoundBridge:
             return self._b.commands
 
         def resolve_slot(self, family: str = "") -> str | None:
+            """解析目标设备：家族限定时**严格匹配**（目标家族不在场返回
+            None，不跨家族兜底——郊狼目标不误触在场负鼠）；家族为空取
+            首个输出设备。"""
             state = self._b._safe_state()
             if state is None:
                 return None
@@ -296,10 +299,19 @@ class SoundBridge:
                 for sid, slot in slots.items():
                     if family_of(slot.type) == family:
                         return sid
+                return None
             for sid, slot in slots.items():
                 if family_of(slot.type) != "BMTR":
                     return sid
             return next(iter(slots), None)
+
+        def slot_family(self, sid: str) -> str:
+            """设备家族查询（核心派发器严格家族校验用）。"""
+            state = self._b._safe_state()
+            if state is None or not sid:
+                return ""
+            slot = state.slots.get(sid)
+            return family_of(slot.type) if slot is not None else ""
 
         def wave_order(self, family: str = "") -> list[str]:
             from dglab.waves import wave_order
@@ -600,7 +612,7 @@ class SoundBridge:
         max_db = float(cfg.get("max_db") or -10.0)
         smooth = max(0.0, min(0.95, float(cfg.get("smooth") or 0.0)))
         low_hz = max(1.0, float(cfg.get("min_hz") or 20.0))
-        high_hz = max(low_hz * 2.0, float(cfg.get("max_hz") or 2000.0))
+        high_hz = max(low_hz * 2.0, min(1000.0, float(cfg.get("max_hz") or 1000.0)))
 
         swap = bool(self.config.get("swap_channels"))
         # 声道路由：默认采集声道0(物理左)→left_* 变量、声道1(物理右)→right_*；

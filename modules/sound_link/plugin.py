@@ -12,7 +12,7 @@ META["config"] 声明全部配置项，宿主装载 config/sound_link.json 时�
 META = {
     "id": "sound_link",
     "name": "音频联动",
-    "version": "0.3.1",
+    "version": "0.3.2",
     "description": "纯输入联动：采集麦克风/系统声音，实时输出左/右响度、"
                    "左/右频率与左右推流值六个映射变量；事件流周期把推流值"
                    "推入核心「外部脉冲流」参数，输出频率跟随声音音高。",
@@ -76,13 +76,13 @@ META = {
             "desc": "指数平滑系数，越大越稳（0 关闭平滑）",
         },
         "min_hz": {
-            "label": "音高下限 (Hz)", "type": "float", "default": 20.0,
-            "min": 10.0, "max": 500.0, "step": 5.0, "group": "audio",
+            "label": "音高下限 (Hz)", "type": "int", "default": 20,
+            "min": 10, "max": 500, "step": 5, "group": "audio",
             "desc": "检测下限，映射到设备频率 10（对数刻度）",
         },
         "max_hz": {
-            "label": "音高上限 (Hz)", "type": "float", "default": 2000.0,
-            "min": 100.0, "max": 8000.0, "step": 50.0, "group": "audio",
+            "label": "音高上限 (Hz)", "type": "int", "default": 1000,
+            "min": 100, "max": 1000, "step": 10, "group": "audio",
             "desc": "检测上限，映射到设备频率 1000（对数刻度）",
         },
     },
