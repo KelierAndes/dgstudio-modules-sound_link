@@ -1,15 +1,3 @@
-"""音频联动模块单测。
-
-覆盖：分析纯函数（响度 dB 映射 / FFT 主频 / 频率→设备逻辑频率对数映射）、
-桥接器一拍分析喂六个信号（响度/频率/推流值 × 左右）、事件流周期卡推入
-核心 in_pulse_* 参数（经核心派发器，0=静音帧、0.1s 节流）、默认事件卡
-播种、插件 META / link_params 契约。不依赖音频硬件（sounddevice /
-pyaudiowpatch 仅在真实开流时导入，测试用哨兵流对象绕过）。
-
-运行（模块仓库根目录）::
-
-    python -m unittest discover -s tests
-"""
 from __future__ import annotations
 
 import asyncio
@@ -34,13 +22,12 @@ from modules.sound_link.bridge import (DEFAULT_EVENT_CARDS, PARAM_DEFS,
 from modules.sound_link.plugin import META, SoundLinkModule
 
 SR = 48000.0
-BLOCK = 4800            # 100ms @48k，与核心脉冲帧对齐
+BLOCK = 4800
 
 
 def _sine(freq: float, seconds: float = 0.1, amp: float = 0.5,
           channels: int = 2, per_channel: dict[int, float] | None = None
           ) -> np.ndarray:
-    """立体声正弦测试块：默认全通道同频，per_channel 可逐通道指定频率。"""
     t = np.arange(int(SR * seconds)) / SR
     cols = []
     for ch in range(channels):
@@ -50,7 +37,6 @@ def _sine(freq: float, seconds: float = 0.1, amp: float = 0.5,
 
 
 class FakeCommands:
-    """引擎命令层假件：记录事件流派发链路上的脉冲推入（不触碰真实设备）。"""
 
     def __init__(self):
         self.state = EngineState(backend="ble")
@@ -96,12 +82,11 @@ class FakeCommands:
 
 
 def _bridge(config: dict | None = None) -> tuple[SoundBridge, FakeCommands]:
-    """带哨兵输入流的桥接器（测试不触碰 sounddevice / 音频硬件）。"""
     commands = FakeCommands()
     bridge = SoundBridge(SoundConfig(config or {}), commands.get_state,
                          commands)
     bridge.log = lambda msg: None
-    bridge._stream = object()                      # 哨兵：跳过真实开流
+    bridge._stream = object()
     bridge._opened_sig = bridge._stream_signature()
     bridge._samplerate = SR
     return bridge, commands
@@ -110,7 +95,6 @@ def _bridge(config: dict | None = None) -> tuple[SoundBridge, FakeCommands]:
 class AnalysisFunctionTests(unittest.TestCase):
     def test_rms_dbfs(self):
         self.assertEqual(rms_dbfs(np.zeros(100, dtype=np.float32)), -120.0)
-        # 0.5 幅度正弦 RMS = 0.5/√2 ≈ -9.03 dBFS
         db = rms_dbfs(_sine(440, amp=0.5)[:, 0])
         self.assertAlmostEqual(db, -9.03, delta=0.1)
 
@@ -118,7 +102,6 @@ class AnalysisFunctionTests(unittest.TestCase):
         self.assertEqual(dbfs_to_level(-60, -60, -10), 0.0)
         self.assertEqual(dbfs_to_level(-10, -60, -10), 100.0)
         self.assertEqual(dbfs_to_level(-35, -60, -10), 50.0)
-        # 越界钳制
         self.assertEqual(dbfs_to_level(0, -60, -10), 100.0)
         self.assertEqual(dbfs_to_level(-120, -60, -10), 0.0)
 
@@ -131,7 +114,6 @@ class AnalysisFunctionTests(unittest.TestCase):
         self.assertAlmostEqual(freq, 880.0, delta=3.0)
 
     def test_dominant_frequency_band_limited(self):
-        # 带外能量（100Hz + 8kHz）不干扰带内主频 440
         t = np.arange(int(SR * 0.1)) / SR
         mix = (0.1 * np.sin(2 * math.pi * 100 * t)
                + 0.4 * np.sin(2 * math.pi * 440 * t)
@@ -148,18 +130,14 @@ class AnalysisFunctionTests(unittest.TestCase):
     def test_hz_to_logical_log_scale(self):
         self.assertEqual(hz_to_logical(20, 20, 2000), 10)
         self.assertEqual(hz_to_logical(2000, 20, 2000), 1000)
-        # 对数刻度中点：几何均值 200Hz → 10 + 990/2 ≈ 505
         self.assertEqual(hz_to_logical(200, 20, 2000), 505)
-        # 越界钳制
         self.assertEqual(hz_to_logical(1, 20, 2000), 10)
         self.assertEqual(hz_to_logical(9000, 20, 2000), 1000)
 
 
 class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
-    """一拍分析：喂六个信号；脉冲推入全部经事件流派发链路。"""
 
     def setUp(self):
-        # 派发器 0.1s 节流旁路：测试快速连拍不丢帧
         patcher = unittest.mock.patch.object(params_mod,
                                              "PULSE_PUSH_MIN_INTERVAL_S", 0)
         patcher.start()
@@ -176,35 +154,30 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
             level = bridge.engine.signals[f"{side}_loudness"]
             self.assertGreater(level, 0.0)
             self.assertLessEqual(level, 100.0)
-            # 推流值 = 主频对数映射到设备逻辑频率
             self.assertEqual(bridge.engine.signals[f"{side}_pulse"],
                              hz_to_logical(freq, 20.0, 1000.0))
-        # 未配置事件流（宿主未装载卡片）时模块自身不推帧
         self.assertEqual(commands.pushed, [])
 
     async def test_event_card_pushes_pulse_frames(self):
-        """默认事件卡（周期 100ms）把推流值推入 in_pulse_a/b。"""
         bridge, commands = _bridge()
-        bridge._loop = asyncio.get_running_loop()   # _spawn 调度推流协程用
+        bridge._loop = asyncio.get_running_loop()
         bridge.engine.set_event_cards(DEFAULT_EVENT_CARDS)
         bridge._blocks.append(_sine(0, per_channel={0: 440.0, 1: 880.0}))
         bridge._tick()
-        bridge.engine.tick_event_cards(0.0)       # 首拍立即到期
-        await asyncio.sleep(0)                    # 让出节拍：推流协程执行
+        bridge.engine.tick_event_cards(0.0)
+        await asyncio.sleep(0)
         self.assertEqual(len(commands.pushed), 2)
         by_ch = {ch: (f, lv) for f, ch, lv in commands.pushed}
         self.assertEqual(by_ch["A"][0], hz_to_logical(440.0, 20.0, 1000.0))
         self.assertEqual(by_ch["B"][0], hz_to_logical(880.0, 20.0, 1000.0))
-        self.assertEqual(by_ch["A"][1], 100)      # 非静音帧电平 100
+        self.assertEqual(by_ch["A"][1], 100)
 
-        # 恒定音：周期再次到期时同值也继续推帧（流语义，非边沿动作）
         bridge._tick()
         bridge.engine.tick_event_cards(0.1)
         await asyncio.sleep(0)
         self.assertEqual(len(commands.pushed), 4)
 
     async def test_silence_pushes_zero_pulse(self):
-        """静音：推流值归 0 → 派发链路生成电平 0 的静音帧，频率沿用上一拍。"""
         bridge, commands = _bridge()
         bridge._loop = asyncio.get_running_loop()
         bridge.engine.set_event_cards(DEFAULT_EVENT_CARDS)
@@ -219,7 +192,7 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertEqual(bridge.engine.signals["left_pulse"], 0)
         silent = [p for p in commands.pushed if p[1] == "A"][-1]
-        self.assertEqual(silent[2], 0)                    # 静音帧电平 0
+        self.assertEqual(silent[2], 0)
         self.assertGreater(audible_logical, 0)
 
     async def test_empty_window_feeds_zero_signals(self):
@@ -232,7 +205,6 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         bridge, _ = _bridge({"swap_channels": True})
         bridge._blocks.append(_sine(0, amp=0.5, per_channel={0: 440.0, 1: 880.0}))
         bridge._tick()
-        # 交换后：采集声道1(880) → 左变量、声道0(440) → 右变量
         self.assertAlmostEqual(bridge.engine.signals["left_frequency"], 880.0,
                                delta=3.0)
         self.assertAlmostEqual(bridge.engine.signals["right_frequency"], 440.0,
@@ -258,18 +230,16 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(meta["id"], "sound_link")
         self.assertEqual(meta["settings_key"], "sound_link")
         self.assertEqual(meta["version"], "0.3.2")
-        # 六个映射变量与 bridge PARAM_DEFS 一致
         self.assertEqual(set(meta["params"]), set(PARAM_DEFS))
         self.assertEqual(set(meta["params"]),
                          {"left_loudness", "right_loudness",
                           "left_frequency", "right_frequency",
                           "left_pulse", "right_pulse"})
-        # 配置声明：设备键 + 左右交换；无映射表/输出表（事件流是唯一数据面）
         cfg = meta["config"]
         self.assertIn("microphone", cfg)
         self.assertIn("speaker", cfg)
         self.assertIn("swap_channels", cfg)
-        self.assertNotIn("device", cfg)          # 旧键已由两个设备键取代
+        self.assertNotIn("device", cfg)
         self.assertNotIn("mappings", cfg)
         self.assertNotIn("outputs", cfg)
 
@@ -283,7 +253,6 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(spec["microphone"]["choices"][0], "")
         self.assertEqual(spec["speaker"]["choices"][0], "")
 
-        # 打补丁模拟扫描结果：choices = 系统默认 + 枚举设备名
         orig_mic, orig_spk = bridge_mod.list_microphones, bridge_mod.list_speakers
         try:
             bridge_mod.list_microphones = lambda: ["阵列麦克风 (AMD Audio Device)",
@@ -314,7 +283,6 @@ class PluginContractTests(unittest.TestCase):
                           "left_pulse", "right_pulse"])
 
     def test_default_event_cards_target_core_inputs(self):
-        """默认事件卡动作引用的核心输入参数与变量全部有效。"""
         specs = input_specs()
         for card in DEFAULT_EVENT_CARDS:
             self.assertEqual(card["trigger"], "period")
@@ -342,7 +310,6 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(len(ctx.settings["events"]), 1)
         self.assertEqual(ctx.settings["events"][0]["name"], "音频脉冲流推入")
         self.assertTrue(logs)
-        # 再次装载不覆盖用户编辑
         ctx.settings["events"] = [{"name": "自定义"}]
         module.on_load(ctx)
         self.assertEqual(ctx.settings["events"], [{"name": "自定义"}])
