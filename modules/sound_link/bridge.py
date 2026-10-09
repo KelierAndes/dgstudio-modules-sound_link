@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import asyncio
@@ -15,39 +14,69 @@ from dglab.params import (build_dispatchers, core_alias_values, core_inputs,
                           device_state_values, input_ranges)
 from dglab.state import family_of
 
-__all__ = ["SoundBridge", "SoundConfig", "PARAM_DEFS", "DEFAULT_EVENT_CARDS",
-           "list_microphones", "list_speakers",
-           "rms_dbfs", "dbfs_to_level", "dominant_frequency",
-           "hz_to_logical"]
+__all__ = ["SoundBridge", "SoundConfig", "DEVICES", "PARAM_DEFS", "PULSE_MODES",
+           "list_microphones", "list_speakers", "migrate_settings",
+           "rms_dbfs", "dbfs_to_level", "dominant_frequency", "hz_to_logical"]
 
 TICK_S = 0.1
 MAX_WINDOW_SAMPLES = 8192
 SILENCE_LEVEL = 1.0
 
-PARAM_DEFS: dict[str, dict[str, str]] = {
-    "left_loudness": {"label": "左响度", "desc": "左声道响度 0-100"},
-    "right_loudness": {"label": "右响度", "desc": "右声道响度 0-100"},
-    "left_frequency": {"label": "左频率", "desc": "左声道主频率 (Hz)"},
-    "right_frequency": {"label": "右频率", "desc": "右声道主频率 (Hz)"},
-    "left_pulse": {"label": "左推流", "desc": "左声道推流值（静音=0，否则=主频）"},
-    "right_pulse": {"label": "右推流", "desc": "右声道推流值（静音=0，否则=主频）"},
+DEVICES: tuple[tuple[str, str], ...] = (("mic", "麦克风"), ("loop", "系统声音"))
+SIDES: tuple[tuple[str, str], ...] = (("left", "左"), ("right", "右"))
+
+PULSE_MODES = {"off": "不推流", "ab": "左→A · 右→B", "a": "仅左→A",
+               "b": "仅右→B"}
+_PULSE_CHANNELS = {
+    "off": {},
+    "ab": {"left": "A", "right": "B"},
+    "a": {"left": "A"},
+    "b": {"right": "B"},
 }
 
-DEFAULT_EVENT_CARDS: list[dict] = [
-    {"name": "音频脉冲流推入", "trigger": "period", "arg": 100,
-     "actions": [
-         {"dir": "in", "param": "in_pulse_a", "var": "left_pulse"},
-         {"dir": "in", "param": "in_pulse_b", "var": "right_pulse"},
-     ]},
-]
+PARAM_DEFS: dict[str, dict[str, str]] = {}
+for _dev_key, _dev_label in DEVICES:
+    for _side_key, _side_label in SIDES:
+        PARAM_DEFS[f"{_dev_key}_{_side_key}_loudness"] = {
+            "label": f"{_dev_label} · {_side_label}响度",
+            "desc": f"{_dev_label}{_side_label}声道响度 0-100"}
+        PARAM_DEFS[f"{_dev_key}_{_side_key}_frequency"] = {
+            "label": f"{_dev_label} · {_side_label}频率",
+            "desc": f"{_dev_label}{_side_label}声道主频率 (Hz)"}
+
+
+def migrate_settings(settings, log=None) -> bool:
+    """旧版「单一声音来源」配置迁移为双设备开关。
+
+    source=loopback 的用途户升级后仍然只监听系统声音（麦克风那一路关掉），
+    避免两路同时推流互相抢通道。
+    """
+    if "source" not in settings:
+        return False
+    source = str(settings.pop("source") or "microphone")
+    loopback = source == "loopback"
+    settings["mic_enabled"] = not loopback
+    settings["loop_enabled"] = loopback
+    settings["mic_pulse"] = "off" if loopback else str(
+        settings.get("mic_pulse") or "ab")
+    settings["loop_pulse"] = "ab" if loopback else str(
+        settings.get("loop_pulse") or "off")
+    if log is not None:
+        log("音频联动：已把「声音来源」设置迁移为麦克风 / 系统声音双开关")
+    return True
 
 
 class SoundConfig(dict):
 
     DEFAULTS = {
-        "source": "microphone",
+        "mic_enabled": True,
         "microphone": "",
+        "mic_pulse": "ab",
+        "mic_mappings": [],
+        "loop_enabled": False,
         "speaker": "",
+        "loop_pulse": "off",
+        "loop_mappings": [],
         "swap_channels": False,
         "gain": 1.0,
         "min_db": -60.0,
@@ -168,6 +197,255 @@ def hz_to_logical(hz: float, low_hz: float, high_hz: float) -> int:
     return 10 + int(round(t * 990))
 
 
+class _EngineGroup:
+    """两路采集各持一张映射表；对核心只暴露合并后的信号视图。"""
+
+    def __init__(self, sources: dict[str, "_Source"]):
+        self._sources = sources
+
+    @property
+    def signals(self) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for source in self._sources.values():
+            out.update(source.engine.signals)
+        return out
+
+    @property
+    def errors(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for key, source in self._sources.items():
+            out.update({f"{key}:{name}": text for name, text
+                        in source.engine.errors.items()})
+        return out
+
+    def pump(self) -> None:
+        for source in self._sources.values():
+            source.engine.pump()
+
+
+class _Source:
+    """一路声音采集：设备句柄、采样块、平滑状态与自己的映射表。"""
+
+    def __init__(self, key: str, label: str, bridge: "SoundBridge"):
+        self.key = key
+        self.label = label
+        self.bridge = bridge
+        self.blocks: deque[np.ndarray] = deque(maxlen=64)
+        self.stream: Any = None
+        self.pa: Any = None
+        self.pa_stream: Any = None
+        self.opened_sig: tuple | None = None
+        self.open_error: tuple[float, str] | None = None
+        self.samplerate = 48000.0
+        self.channels = 2
+        self.smoothed: dict[str, float] = {}
+        self.last_freq: dict[str, float] = {"left": 0.0, "right": 0.0}
+        self.engine = MappingEngine(bridge._dispatch,
+                                    device_vars=bridge._device_vars,
+                                    ranges=input_ranges())
+
+    @property
+    def config(self) -> dict:
+        return self.bridge.config
+
+    def is_enabled(self) -> bool:
+        return bool(self.config.get(f"{self.key}_enabled"))
+
+    def device_name(self) -> str:
+        key = "speaker" if self.key == "loop" else "microphone"
+        return str(self.config.get(key) or "").strip()
+
+    def pulse_mode(self) -> str:
+        return str(self.config.get(f"{self.key}_pulse") or "off")
+
+    def signature(self) -> tuple:
+        return (self.is_enabled(), self.device_name())
+
+    def ensure(self) -> bool:
+        sig = self.signature()
+        if self.stream is not None or self.pa_stream is not None:
+            if sig == self.opened_sig:
+                return True
+            self.close()
+        if not sig[0]:
+            self.opened_sig = None
+            return False
+        try:
+            if self.key == "loop":
+                self._open_loopback()
+            else:
+                self._open_microphone()
+            self.opened_sig = sig
+            self.open_error = None
+            return True
+        except Exception as exc:
+            self.close()
+            now = time.monotonic()
+            if self.open_error is None or now - self.open_error[0] > 5.0:
+                self.open_error = (now, str(exc))
+                self.bridge.log(f"{self.label}采集打开失败（5 秒后自动重试）: {exc}")
+            self.opened_sig = None
+            return False
+
+    def close(self) -> None:
+        pa_stream, self.pa_stream = self.pa_stream, None
+        if pa_stream is not None:
+            try:
+                pa_stream.stop_stream()
+                pa_stream.close()
+            except Exception:
+                pass
+        pa, self.pa = self.pa, None
+        if pa is not None:
+            try:
+                pa.terminate()
+            except Exception:
+                pass
+        stream, self.stream = self.stream, None
+        if stream is None:
+            return
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:
+            pass
+
+    def take_window(self) -> np.ndarray | None:
+        if not self.blocks:
+            return None
+        blocks = list(self.blocks)
+        self.blocks.clear()
+        window = np.concatenate(blocks, axis=0)
+        if window.shape[0] > MAX_WINDOW_SAMPLES:
+            window = window[-MAX_WINDOW_SAMPLES:]
+        return window
+
+    def column(self, window: np.ndarray | None, index: int) -> np.ndarray:
+        if window is None or window.size == 0:
+            return np.zeros(0, dtype=np.float32)
+        if window.ndim < 2 or window.shape[1] <= index:
+            return window.reshape(-1)
+        return window[:, index]
+
+    def on_audio(self, indata, frames, time_info, status) -> None:
+        self.blocks.append(np.array(indata, copy=True))
+
+    def pa_callback(self, indata, frame_count, time_info, status):
+        try:
+            arr = np.frombuffer(indata, dtype=np.float32)
+            arr = arr.reshape(-1, self.channels) if self.channels > 1 \
+                else arr.reshape(-1, 1)
+            self.blocks.append(arr.copy())
+        except Exception:
+            pass
+        import pyaudiowpatch as pyaudio
+        return None, pyaudio.paContinue
+
+    def _log_bound(self, device_name: str) -> None:
+        swap = bool(self.config.get("swap_channels"))
+        lcol, rcol = (1, 0) if swap else (0, 1)
+        mode = PULSE_MODES.get(self.pulse_mode(), self.pulse_mode())
+        self.bridge.log(
+            f"{self.label}采集已打开: {device_name} "
+            f"({self.samplerate:.0f} Hz × {self.channels} 声道)\n"
+            f"声道绑定: 采集声道{lcol} → {self.key}_left_*，声道{rcol} → "
+            f"{self.key}_right_*；频率驱动脉冲流：{mode}"
+            f"（左右接反时开启「左右声道交换」对调）")
+
+    def _open_microphone(self) -> None:
+        import sounddevice as sd
+
+        idx, dev = self._resolve_microphone(sd)
+        if idx is None:
+            raise RuntimeError("未找到匹配的录音设备（检查「麦克风设备」设置）")
+        max_in = int(dev.get("max_input_channels") or 0)
+        self.channels = max(1, min(2, max_in))
+        self.samplerate = float(dev.get("default_samplerate") or 48000.0)
+        self.stream = sd.InputStream(
+            samplerate=self.samplerate, channels=self.channels, device=idx,
+            blocksize=0, dtype="float32", callback=self.on_audio,
+        )
+        self.stream.start()
+        self._log_bound(str(dev.get("name") or idx))
+
+    def _resolve_microphone(self, sd):
+        name = self.device_name()
+        devices = sd.query_devices()
+        wasapi = _wasapi_api_index(sd)
+        default_idx = None
+        if wasapi is not None:
+            hostapis = sd.query_hostapis()
+            default_idx = int(hostapis[wasapi].get("default_input_device") or -1)
+
+        candidates: list[tuple[bool, int, dict]] = []
+        for idx, dev in enumerate(devices):
+            if int(dev.get("max_input_channels") or 0) <= 0:
+                continue
+            candidates.append((dev.get("hostapi") == wasapi, idx, dev))
+        if not candidates:
+            return None, None
+        candidates.sort(key=lambda c: not c[0])
+
+        if not name:
+            if default_idx is not None and default_idx >= 0:
+                return default_idx, devices[default_idx]
+            return candidates[0][1], candidates[0][2]
+
+        for match in (lambda n: n == name, lambda n: name in n):
+            for _preferred, idx, dev in candidates:
+                if match(str(dev.get("name") or "")):
+                    return idx, dev
+        raise RuntimeError(f"未找到匹配「{name}」的录音设备")
+
+    def _resolve_loopback(self, pa, name: str):
+        import pyaudiowpatch as pyaudio
+
+        loopbacks = list(pa.get_loopback_device_info_generator())
+        if not loopbacks:
+            raise RuntimeError("未枚举到任何可回环采集的播放设备")
+        if name:
+            for dev in loopbacks:
+                if name in str(dev.get("name") or ""):
+                    return dev
+            raise RuntimeError(f"未找到包含「{name}」的回环播放设备")
+        wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+        default_speakers = pa.get_device_info_by_index(
+            int(wasapi["defaultOutputDevice"]))
+        if default_speakers.get("isLoopbackDevice"):
+            return default_speakers
+        default_name = str(default_speakers.get("name") or "")
+        for dev in loopbacks:
+            if default_name and default_name in str(dev.get("name") or ""):
+                return dev
+        return loopbacks[0]
+
+    def _open_loopback(self) -> None:
+        import pyaudiowpatch as pyaudio
+
+        pa = pyaudio.PyAudio()
+        try:
+            target = self._resolve_loopback(pa, self.device_name())
+            channels = max(1, int(target.get("maxInputChannels") or 2))
+            rate = int(target.get("defaultSampleRate") or 48000)
+            self.pa_stream = pa.open(
+                format=pyaudio.paFloat32, channels=channels, rate=rate,
+                input=True, input_device_index=int(target["index"]),
+                frames_per_buffer=int(rate * 0.04),
+                stream_callback=self.pa_callback,
+            )
+            self.pa_stream.start_stream()
+            self.pa = pa
+            self.channels = channels
+            self.samplerate = float(rate)
+            self._log_bound(str(target.get("name") or "系统默认播放设备"))
+        except Exception:
+            try:
+                pa.terminate()
+            except Exception:
+                pass
+            raise
+
+
 class SoundBridge:
 
     def __init__(self, config: SoundConfig, get_state: Callable[[], Any],
@@ -175,30 +453,26 @@ class SoundBridge:
         self.config = config
         self.get_state = get_state
         self.commands = commands
+        self.events = events
 
         self.log: Callable[[str], None] = print
         self._running = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task | None = None
-
-        self._stream: Any = None
-        self._pa: Any = None
-        self._pa_stream: Any = None
-        self._opened_sig: tuple | None = None
-        self._blocks: deque[np.ndarray] = deque(maxlen=64)
-        self._samplerate = 48000.0
-        self._channels = 2
-        self._last_open_error: tuple[float, str] | None = None
-
-        self._smoothed: dict[str, float] = {}
-        self._last_freq: dict[str, float] = {"left": 0.0, "right": 0.0}
         self.last_values: dict[str, float] = {}
+        self._pulse_owner: dict[str, str] = {}
 
-        self.engine = MappingEngine(self._dispatch,
-                                    device_vars=self._device_vars,
-                                    ranges=input_ranges())
+        self.sources = {key: _Source(key, label, self)
+                        for key, label in DEVICES}
+        self.engine = _EngineGroup(self.sources)
         self._api = self._DeviceApi(self)
         self.dispatchers = build_dispatchers(self._api, core_inputs())
+        self.apply_config()
+
+    # ---------------------------------------------------------------- 配置
+    def apply_config(self) -> None:
+        for key, source in self.sources.items():
+            source.engine.set_mappings(self.config.get(f"{key}_mappings") or [])
 
     def _safe_state(self):
         try:
@@ -270,8 +544,13 @@ class SoundBridge:
                                                level=level, slot_id=slot_id)
 
         def pulse_level(self, channel: str) -> int:
+            """脉冲流强度跟随响度：取当前推该通道的那一路采集的平滑响度。"""
+            key = self._b._pulse_owner.get(str(channel))
+            source = self._b.sources.get(key) if key else None
+            if source is None:
+                return 100
             side = "left" if channel == "A" else "right"
-            level = self._b._smoothed.get(side, 0.0)
+            level = source.smoothed.get(side, 0.0)
             return max(0, min(100, int(round(level))))
 
         def zap(self, channel, seconds=1.0, slot_id=None):
@@ -289,279 +568,30 @@ class SoundBridge:
         def run(self, coro) -> None:
             self._b._spawn(coro)
 
-
+    # ---------------------------------------------------------------- 生命周期
     async def start(self) -> None:
         if self._running:
             return
         self._running = True
         self._loop = asyncio.get_running_loop()
-        self._opened_sig = None
+        self.apply_config()
+        for source in self.sources.values():
+            source.ensure()
         self._task = asyncio.create_task(self._tick_loop())
-        self.log("音频联动已启动（每 0.1s 分析一拍：响度 / 频率 / 推流值 → "
-                 "信号空间；脉冲流由事件流周期卡推入 in_pulse_*）")
+        self.log("音频联动已启动（每 0.1s 一拍：双路采集各自分析响度 / 频率并"
+                 "按本路映射表派发；频率值直接推入「外部脉冲流」）")
 
     async def stop(self) -> None:
         self._running = False
         if self._task:
             self._task.cancel()
             self._task = None
-        self._close_stream()
+        for source in self.sources.values():
+            source.close()
         self.log("音频联动已停止")
 
     def close(self) -> None:
         pass
-
-
-    def _stream_signature(self) -> tuple:
-        return (str(self.config.get("source") or "microphone"),
-                str(self.config.get("microphone") or ""),
-                str(self.config.get("speaker") or ""),
-                str(self.config.get("device") or ""))
-
-    def _ensure_stream(self) -> None:
-        sig = self._stream_signature()
-        if self._stream is not None or self._pa_stream is not None:
-            if sig == self._opened_sig:
-                return
-            self._close_stream()
-        try:
-            if str(self.config.get("source")) == "loopback":
-                self._open_loopback()
-            else:
-                self._open_microphone()
-            self._opened_sig = sig
-            self._last_open_error = None
-        except Exception as exc:
-            self._close_stream()
-            now = time.monotonic()
-            if self._last_open_error is None or now - self._last_open_error[0] > 5.0:
-                self._last_open_error = (now, str(exc))
-                self.log(f"音频输入流打开失败（5 秒后自动重试）: {exc}")
-            self._opened_sig = None
-
-    def _bound_name(self) -> str:
-        source = str(self.config.get("source") or "microphone")
-        key = "speaker" if source == "loopback" else "microphone"
-        return (str(self.config.get(key) or "").strip()
-                or str(self.config.get("device") or "").strip())
-
-    def _open_microphone(self) -> None:
-        import sounddevice as sd
-
-        idx, dev = self._resolve_microphone(sd)
-        if idx is None:
-            raise RuntimeError("未找到匹配的录音设备（检查「麦克风设备」设置）")
-        max_in = int(dev.get("max_input_channels") or 0)
-        self._channels = max(1, min(2, max_in))
-        self._samplerate = float(dev.get("default_samplerate") or 48000.0)
-        self._stream = sd.InputStream(
-            samplerate=self._samplerate, channels=self._channels, device=idx,
-            blocksize=0, dtype="float32", callback=self._on_audio,
-        )
-        self._stream.start()
-        self._log_bound(str(dev.get("name") or idx))
-
-    def _resolve_microphone(self, sd):
-        name = self._bound_name()
-        devices = sd.query_devices()
-        wasapi = _wasapi_api_index(sd)
-        default_idx = None
-        if wasapi is not None:
-            hostapis = sd.query_hostapis()
-            default_idx = int(hostapis[wasapi].get("default_input_device") or -1)
-
-        candidates: list[tuple[bool, int, dict]] = []
-        for idx, dev in enumerate(devices):
-            if int(dev.get("max_input_channels") or 0) <= 0:
-                continue
-            candidates.append((dev.get("hostapi") == wasapi, idx, dev))
-        if not candidates:
-            return None, None
-        candidates.sort(key=lambda c: not c[0])
-
-        if not name:
-            if default_idx is not None and default_idx >= 0:
-                return default_idx, devices[default_idx]
-            return candidates[0][1], candidates[0][2]
-
-        for match in (lambda n: n == name, lambda n: name in n):
-            for _preferred, idx, dev in candidates:
-                if match(str(dev.get("name") or "")):
-                    return idx, dev
-        raise RuntimeError(f"未找到匹配「{name}」的录音设备")
-
-    def _resolve_loopback_device(self, pa, name: str):
-        import pyaudiowpatch as pyaudio
-
-        loopbacks = list(pa.get_loopback_device_info_generator())
-        if not loopbacks:
-            raise RuntimeError("未枚举到任何可回环采集的播放设备")
-        if name:
-            for dev in loopbacks:
-                if name in str(dev.get("name") or ""):
-                    return dev
-            raise RuntimeError(f"未找到包含「{name}」的回环播放设备")
-        wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
-        default_speakers = pa.get_device_info_by_index(
-            int(wasapi["defaultOutputDevice"]))
-        if default_speakers.get("isLoopbackDevice"):
-            return default_speakers
-        default_name = str(default_speakers.get("name") or "")
-        for dev in loopbacks:
-            if default_name and default_name in str(dev.get("name") or ""):
-                return dev
-        return loopbacks[0]
-
-    def _open_loopback(self) -> None:
-        import pyaudiowpatch as pyaudio
-
-        pa = pyaudio.PyAudio()
-        try:
-            target = self._resolve_loopback_device(pa, self._bound_name())
-            channels = max(1, int(target.get("maxInputChannels") or 2))
-            rate = int(target.get("defaultSampleRate") or 48000)
-            self._pa_stream = pa.open(
-                format=pyaudio.paFloat32, channels=channels, rate=rate,
-                input=True, input_device_index=int(target["index"]),
-                frames_per_buffer=int(rate * 0.04),
-                stream_callback=self._pa_callback,
-            )
-            self._pa_stream.start_stream()
-            self._pa = pa
-            self._channels = channels
-            self._samplerate = float(rate)
-            self._log_bound(str(target.get("name") or "系统默认播放设备"))
-        except Exception:
-            try:
-                pa.terminate()
-            except Exception:
-                pass
-            raise
-
-    def _log_bound(self, device_name: str) -> None:
-        swap = bool(self.config.get("swap_channels"))
-        source = str(self.config.get("source") or "microphone")
-        lcol, rcol = (1, 0) if swap else (0, 1)
-        self.log(
-            f"音频输入已打开: {device_name} "
-            f"({self._samplerate:.0f} Hz × {self._channels} 声道，"
-            f"{'系统声音回环' if source == 'loopback' else '麦克风'}）\n"
-            f"声道绑定: 采集声道{lcol} → 左变量 left_*，声道{rcol} → 右变量 "
-            f"right_*；默认事件流把左右推流值推入设备 A/B 通道脉冲流"
-            f"（左右接反时开启「左右声道交换」对调）")
-
-    def _close_stream(self) -> None:
-        pa_stream, self._pa_stream = self._pa_stream, None
-        if pa_stream is not None:
-            try:
-                pa_stream.stop_stream()
-                pa_stream.close()
-            except Exception:
-                pass
-        pa, self._pa = self._pa, None
-        if pa is not None:
-            try:
-                pa.terminate()
-            except Exception:
-                pass
-        stream, self._stream = self._stream, None
-        if stream is None:
-            return
-        try:
-            stream.stop()
-            stream.close()
-        except Exception:
-            pass
-
-    def _on_audio(self, indata, frames, time_info, status) -> None:
-        if status:
-            pass
-        self._blocks.append(np.array(indata, copy=True))
-
-    def _pa_callback(self, indata, frame_count, time_info, status):
-        try:
-            arr = np.frombuffer(indata, dtype=np.float32)
-            arr = arr.reshape(-1, self._channels) if self._channels > 1 \
-                else arr.reshape(-1, 1)
-            self._blocks.append(arr.copy())
-        except Exception:
-            pass
-        import pyaudiowpatch as pyaudio
-        return None, pyaudio.paContinue
-
-
-    async def _tick_loop(self) -> None:
-        try:
-            while self._running:
-                await asyncio.sleep(TICK_S)
-                try:
-                    self._tick()
-                except Exception:
-                    self._log_error("分析节拍失败")
-        except asyncio.CancelledError:
-            pass
-
-    def _take_window(self) -> np.ndarray | None:
-        if not self._blocks:
-            return None
-        blocks = list(self._blocks)
-        self._blocks.clear()
-        window = np.concatenate(blocks, axis=0)
-        if window.shape[0] > MAX_WINDOW_SAMPLES:
-            window = window[-MAX_WINDOW_SAMPLES:]
-        return window
-
-    def _tick(self) -> None:
-        if self._stream is None and self._pa_stream is None:
-            self._ensure_stream()
-        window = self._take_window()
-        cfg = self.config
-        gain_db = 20.0 * math.log10(max(1e-4, float(cfg.get("gain") or 1.0)))
-        min_db = float(cfg.get("min_db") or -60.0)
-        max_db = float(cfg.get("max_db") or -10.0)
-        smooth = max(0.0, min(0.95, float(cfg.get("smooth") or 0.0)))
-        low_hz = max(1.0, float(cfg.get("min_hz") or 20.0))
-        high_hz = max(low_hz * 2.0, min(1000.0, float(cfg.get("max_hz") or 1000.0)))
-
-        swap = bool(self.config.get("swap_channels"))
-        for side, audio_col in (("left", 1 if swap else 0),
-                                ("right", 0 if swap else 1)):
-            column = self._channel_column(window, audio_col)
-            level_raw = dbfs_to_level(rms_dbfs(column) + gain_db,
-                                      min_db, max_db)
-            prev = self._smoothed.get(side)
-            if level_raw < SILENCE_LEVEL or prev is None:
-                level = level_raw
-            else:
-                level = smooth * prev + (1.0 - smooth) * level_raw
-            self._smoothed[side] = level
-
-            if level < SILENCE_LEVEL:
-                freq = self._last_freq.get(side, 0.0)
-            else:
-                freq = dominant_frequency(column, self._samplerate,
-                                          low_hz, high_hz)
-                if freq > 0.0:
-                    self._last_freq[side] = freq
-                else:
-                    freq = self._last_freq.get(side, 0.0)
-
-            self.engine.signal(f"{side}_loudness", round(level, 1))
-            self.engine.signal(f"{side}_frequency", round(freq, 1))
-            pulse = hz_to_logical(freq, low_hz, high_hz) \
-                if level >= SILENCE_LEVEL and freq > 0.0 else 0
-            self.engine.signal(f"{side}_pulse", pulse)
-
-        self.last_values = {name: float(self.engine.signals.get(name, 0.0) or 0.0)
-                            for name in PARAM_DEFS}
-
-    @staticmethod
-    def _channel_column(window: np.ndarray | None, index: int) -> np.ndarray:
-        if window is None or window.size == 0:
-            return np.zeros(0, dtype=np.float32)
-        if window.ndim < 2 or window.shape[1] <= index:
-            return window.reshape(-1)
-        return window[:, index]
 
     def _spawn(self, coro) -> None:
         loop = self._loop
@@ -579,3 +609,82 @@ class SoundBridge:
 
     def _log_error(self, prefix: str) -> None:
         self.log(f"{prefix}:\n{traceback.format_exc()}")
+
+    # ---------------------------------------------------------------- 分析节拍
+    async def _tick_loop(self) -> None:
+        try:
+            while self._running:
+                await asyncio.sleep(TICK_S)
+                try:
+                    self._tick()
+                except Exception:
+                    self._log_error("分析节拍失败")
+        except asyncio.CancelledError:
+            pass
+
+    def _tick(self) -> None:
+        cfg = self.config
+        gain_db = 20.0 * math.log10(max(1e-4, float(cfg.get("gain") or 1.0)))
+        min_db = float(cfg.get("min_db") or -60.0)
+        max_db = float(cfg.get("max_db") or -10.0)
+        smooth = max(0.0, min(0.95, float(cfg.get("smooth") or 0.0)))
+        low_hz = max(1.0, float(cfg.get("min_hz") or 20.0))
+        high_hz = max(low_hz * 2.0, min(1000.0, float(cfg.get("max_hz") or 1000.0)))
+        swap = bool(cfg.get("swap_channels"))
+
+        for source in self.sources.values():
+            if not source.ensure():
+                for side, _label in SIDES:
+                    source.engine.signal(f"{source.key}_{side}_loudness", 0.0)
+                    source.engine.signal(f"{source.key}_{side}_frequency", 0.0)
+                continue
+            window = source.take_window()
+            for side, audio_col in (("left", 1 if swap else 0),
+                                    ("right", 0 if swap else 1)):
+                level, freq = self._measure(
+                    source, side, window, audio_col, gain_db, min_db, max_db,
+                    smooth, low_hz, high_hz)
+                source.engine.signal(f"{source.key}_{side}_loudness",
+                                     round(level, 1))
+                source.engine.signal(f"{source.key}_{side}_frequency",
+                                     round(freq, 1))
+                self._push_pulse(source, side, level, freq, low_hz, high_hz)
+
+        self.last_values = dict(self.engine.signals)
+
+    def _measure(self, source: _Source, side: str, window, audio_col: int,
+                 gain_db: float, min_db: float, max_db: float, smooth: float,
+                 low_hz: float, high_hz: float) -> tuple[float, float]:
+        column = source.column(window, audio_col)
+        level_raw = dbfs_to_level(rms_dbfs(column) + gain_db, min_db, max_db)
+        prev = source.smoothed.get(side)
+        if level_raw < SILENCE_LEVEL or prev is None:
+            level = level_raw
+        else:
+            level = smooth * prev + (1.0 - smooth) * level_raw
+        source.smoothed[side] = level
+
+        if level < SILENCE_LEVEL:
+            return level, source.last_freq.get(side, 0.0)
+        freq = dominant_frequency(column, source.samplerate, low_hz, high_hz)
+        if freq > 0.0:
+            source.last_freq[side] = freq
+            return level, freq
+        return level, source.last_freq.get(side, 0.0)
+
+    def _push_pulse(self, source: _Source, side: str, level: float,
+                    freq: float, low_hz: float, high_hz: float) -> None:
+        """频率值直接驱动推流：走核心 in_pulse_* 的既有派发逻辑（0.1s 节流）。"""
+        channel = _PULSE_CHANNELS.get(source.pulse_mode(), {}).get(side)
+        if not channel:
+            return
+        value = hz_to_logical(freq, low_hz, high_hz) \
+            if (freq > 0.0 and level >= SILENCE_LEVEL) else 0
+        self._pulse_owner[channel] = source.key
+        runner = self.dispatchers.get(f"in_pulse_{channel.lower()}")
+        if runner is None:
+            return
+        try:
+            runner(int(value))
+        except Exception as exc:
+            self.log(f"{source.label} 脉冲流推入失败: {exc!r}")

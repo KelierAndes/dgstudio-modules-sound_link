@@ -12,13 +12,12 @@ import numpy as np
 import _bootstrap  # noqa: F401  定位核心仓库并挂 sys.path
 
 import dglab.params as params_mod
-from dglab.params import input_specs
 from dglab.state import EngineState, Slot
 
-from modules.sound_link.bridge import (DEFAULT_EVENT_CARDS, PARAM_DEFS,
-                                       SoundBridge, SoundConfig, dbfs_to_level,
+from modules.sound_link.bridge import (DEVICES, PARAM_DEFS, SoundBridge,
+                                       SoundConfig, dbfs_to_level,
                                        dominant_frequency, hz_to_logical,
-                                       rms_dbfs)
+                                       migrate_settings, rms_dbfs)
 from modules.sound_link.plugin import META, SoundLinkModule
 
 SR = 48000.0
@@ -81,14 +80,24 @@ class FakeCommands:
         return _noop()
 
 
-def _bridge(config: dict | None = None) -> tuple[SoundBridge, FakeCommands]:
+def _bridge(config: dict | None = None, open_devices=("mic",)
+            ) -> tuple[SoundBridge, FakeCommands]:
     commands = FakeCommands()
     bridge = SoundBridge(SoundConfig(config or {}), commands.get_state,
                          commands)
     bridge.log = lambda msg: None
-    bridge._stream = object()
-    bridge._opened_sig = bridge._stream_signature()
-    bridge._samplerate = SR
+    try:
+        bridge._loop = asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    for key in open_devices:
+        source = bridge.sources[key]
+        if key == "loop":
+            source.pa_stream = object()
+        else:
+            source.stream = object()
+        source.opened_sig = source.signature()
+        source.samplerate = SR
     return bridge, commands
 
 
@@ -134,6 +143,40 @@ class AnalysisFunctionTests(unittest.TestCase):
         self.assertEqual(hz_to_logical(1, 20, 2000), 10)
         self.assertEqual(hz_to_logical(9000, 20, 2000), 1000)
 
+    def test_param_defs_cover_both_devices_without_pulse_vars(self):
+        self.assertEqual(len(PARAM_DEFS), 8)
+        self.assertNotIn("left_pulse", PARAM_DEFS)
+        for key, _label in DEVICES:
+            for name in (f"{key}_left_loudness", f"{key}_left_frequency",
+                         f"{key}_right_loudness", f"{key}_right_frequency"):
+                self.assertIn(name, PARAM_DEFS)
+
+
+class MigrateSettingsTests(unittest.TestCase):
+
+    def test_legacy_single_source_becomes_two_switches(self):
+        logs: list[str] = []
+        settings = {"source": "loopback", "speaker": "扬声器"}
+        self.assertTrue(migrate_settings(settings, logs.append))
+        self.assertNotIn("source", settings)
+        self.assertFalse(settings["mic_enabled"])
+        self.assertTrue(settings["loop_enabled"])
+        self.assertEqual(settings["mic_pulse"], "off")
+        self.assertEqual(settings["loop_pulse"], "ab")
+        self.assertTrue(logs)
+
+    def test_microphone_source_keeps_mic_only(self):
+        settings = {"source": "microphone", "microphone": "阵列麦克风"}
+        self.assertTrue(migrate_settings(settings, None))
+        self.assertTrue(settings["mic_enabled"])
+        self.assertFalse(settings["loop_enabled"])
+        self.assertEqual(settings["mic_pulse"], "ab")
+
+    def test_already_migrated_settings_untouched(self):
+        settings = {"mic_enabled": False, "loop_enabled": True}
+        self.assertFalse(migrate_settings(settings, None))
+        self.assertEqual(settings, {"mic_enabled": False, "loop_enabled": True})
+
 
 class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
 
@@ -143,75 +186,120 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    async def test_tick_feeds_six_variables(self):
+    async def test_tick_feeds_mic_variables(self):
         bridge, commands = _bridge()
-        bridge._blocks.append(_sine(0, per_channel={0: 440.0, 1: 880.0}))
+        bridge.sources["mic"].blocks.append(
+            _sine(0, per_channel={0: 440.0, 1: 880.0}))
         bridge._tick()
-
+        await asyncio.sleep(0)
+        signals = bridge.engine.signals
         for side, freq in (("left", 440.0), ("right", 880.0)):
-            self.assertAlmostEqual(bridge.engine.signals[f"{side}_frequency"],
-                                   freq, delta=3.0)
-            level = bridge.engine.signals[f"{side}_loudness"]
+            self.assertAlmostEqual(signals[f"mic_{side}_frequency"], freq,
+                                   delta=3.0)
+            level = signals[f"mic_{side}_loudness"]
             self.assertGreater(level, 0.0)
             self.assertLessEqual(level, 100.0)
-            self.assertEqual(bridge.engine.signals[f"{side}_pulse"],
-                             hz_to_logical(freq, 20.0, 1000.0))
-        self.assertEqual(commands.pushed, [])
-
-    async def test_event_card_pushes_pulse_frames(self):
-        bridge, commands = _bridge()
-        bridge._loop = asyncio.get_running_loop()
-        bridge.engine.set_event_cards(DEFAULT_EVENT_CARDS)
-        bridge._blocks.append(_sine(0, per_channel={0: 440.0, 1: 880.0}))
-        bridge._tick()
-        bridge.engine.tick_event_cards(0.0)
-        await asyncio.sleep(0)
-        self.assertEqual(len(commands.pushed), 2)
+            self.assertNotIn(f"mic_{side}_pulse", signals)
+        # 频率直接驱动推流：一拍两通道
         by_ch = {ch: (f, lv) for f, ch, lv in commands.pushed}
         self.assertEqual(by_ch["A"][0], hz_to_logical(440.0, 20.0, 1000.0))
         self.assertEqual(by_ch["B"][0], hz_to_logical(880.0, 20.0, 1000.0))
-        self.assertEqual(by_ch["A"][1], 100)
+        self.assertGreater(by_ch["A"][1], 0)
 
+    async def test_disabled_device_reports_zero_and_stays_closed(self):
+        bridge, _ = _bridge()
         bridge._tick()
-        bridge.engine.tick_event_cards(0.1)
+        signals = bridge.engine.signals
+        self.assertEqual(signals["loop_left_frequency"], 0.0)
+        self.assertEqual(signals["loop_left_loudness"], 0.0)
+        self.assertIsNone(bridge.sources["loop"].stream)
+
+    async def test_both_devices_run_with_own_signal_sets(self):
+        bridge, commands = _bridge({"mic_enabled": True, "loop_enabled": True,
+                                    "mic_pulse": "a", "loop_pulse": "b"},
+                                   open_devices=("mic", "loop"))
+        bridge.sources["mic"].blocks.append(_sine(0, per_channel={0: 440.0}))
+        bridge.sources["loop"].blocks.append(
+            _sine(0, amp=0.4, per_channel={1: 880.0}))
+        bridge._tick()
         await asyncio.sleep(0)
-        self.assertEqual(len(commands.pushed), 4)
+        signals = bridge.engine.signals
+        self.assertAlmostEqual(signals["mic_left_frequency"], 440.0, delta=3.0)
+        self.assertAlmostEqual(signals["loop_right_frequency"], 880.0, delta=3.0)
+        self.assertAlmostEqual(signals["loop_left_loudness"], 0.0)
+        channels = {ch for _f, ch, _lv in commands.pushed}
+        self.assertEqual(channels, {"A", "B"})
+
+    async def test_two_mapping_tables_are_independent(self):
+        pushed: list[tuple[str, int]] = []
+        bridge, _ = _bridge({"mic_mappings": [
+            {"param": "in_strength_a", "expr": "{mic_left_loudness} * 2"}],
+            "loop_mappings": [
+            {"param": "in_strength_b", "expr": "{loop_right_loudness} * 3"}]},
+            open_devices=("mic", "loop"))
+        bridge.dispatchers = {
+            "in_strength_a": lambda value: pushed.append(("A", value)),
+            "in_strength_b": lambda value: pushed.append(("B", value)),
+            "in_pulse_a": lambda value: None,
+            "in_pulse_b": lambda value: None,
+        }
+        bridge.apply_config()
+        self.assertEqual(bridge.sources["mic"].engine.mappings,
+                         {"in_strength_a": "{mic_left_loudness} * 2"})
+        self.assertEqual(bridge.sources["loop"].engine.mappings,
+                         {"in_strength_b": "{loop_right_loudness} * 3"})
+        bridge.sources["mic"].blocks.append(_sine(0, per_channel={0: 440.0}))
+        bridge.sources["loop"].blocks.append(_sine(0, per_channel={1: 440.0}))
+        bridge._tick()
+        self.assertTrue(any(name == "A" and value > 0 for name, value in pushed))
+        self.assertTrue(any(name == "B" and value > 0 for name, value in pushed))
+        # 跨表引用不存在的变量时不派发（两路变量互不可见）
+        bridge.sources["mic"].engine.set_mappings(
+            [{"param": "in_strength_a", "expr": "{loop_left_loudness}"}])
+        pushed.clear()
+        bridge.sources["mic"].engine.signal("mic_left_loudness", 50.0)
+        self.assertEqual(pushed, [])
 
     async def test_silence_pushes_zero_pulse(self):
         bridge, commands = _bridge()
-        bridge._loop = asyncio.get_running_loop()
-        bridge.engine.set_event_cards(DEFAULT_EVENT_CARDS)
-        bridge._blocks.append(_sine(440))
+        bridge.sources["mic"].blocks.append(_sine(440))
         bridge._tick()
-        bridge.engine.tick_event_cards(0.0)
         await asyncio.sleep(0)
-        audible_logical = commands.pushed[0][0]
-        bridge._blocks.append(np.zeros((BLOCK, 2), dtype=np.float32))
+        audible = [p for p in commands.pushed if p[1] == "A"][-1]
+        bridge.sources["mic"].blocks.append(np.zeros((BLOCK, 2), np.float32))
         bridge._tick()
-        bridge.engine.tick_event_cards(0.1)
         await asyncio.sleep(0)
-        self.assertEqual(bridge.engine.signals["left_pulse"], 0)
         silent = [p for p in commands.pushed if p[1] == "A"][-1]
         self.assertEqual(silent[2], 0)
-        self.assertGreater(audible_logical, 0)
+        self.assertGreater(audible[0], 0)
 
-    async def test_empty_window_feeds_zero_signals(self):
-        bridge, _ = _bridge()
+    async def test_pulse_off_mode_pushes_nothing(self):
+        bridge, commands = _bridge({"mic_pulse": "off"})
+        bridge.sources["mic"].blocks.append(_sine(440))
         bridge._tick()
-        self.assertEqual(bridge.engine.signals["left_pulse"], 0)
-        self.assertEqual(bridge.engine.signals["right_loudness"], 0.0)
+        self.assertEqual(commands.pushed, [])
 
     async def test_swap_channels_swaps_audio_columns(self):
         bridge, _ = _bridge({"swap_channels": True})
-        bridge._blocks.append(_sine(0, amp=0.5, per_channel={0: 440.0, 1: 880.0}))
+        bridge.sources["mic"].blocks.append(
+            _sine(0, amp=0.5, per_channel={0: 440.0, 1: 880.0}))
         bridge._tick()
-        self.assertAlmostEqual(bridge.engine.signals["left_frequency"], 880.0,
-                               delta=3.0)
-        self.assertAlmostEqual(bridge.engine.signals["right_frequency"], 440.0,
-                               delta=3.0)
+        signals = bridge.engine.signals
+        self.assertAlmostEqual(signals["mic_left_frequency"], 880.0, delta=3.0)
+        self.assertAlmostEqual(signals["mic_right_frequency"], 440.0, delta=3.0)
+
+    async def test_merged_signals_reach_core_view(self):
+        bridge, _ = _bridge({"loop_enabled": True}, open_devices=("mic", "loop"))
+        bridge.sources["loop"].blocks.append(_sine(0, per_channel={0: 300.0}))
+        bridge._tick()
+        self.assertIn("mic_left_loudness", bridge.engine.signals)
+        self.assertIn("loop_left_frequency", bridge.engine.signals)
+        self.assertEqual(sorted(bridge.last_values),
+                         sorted(bridge.engine.signals))
 
 
 class PluginContractTests(unittest.TestCase):
+
     def _plugin_source(self) -> str:
         path = os.path.join(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__))), "modules", "sound_link", "plugin.py")
@@ -229,19 +317,29 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "sound_link")
         self.assertEqual(meta["settings_key"], "sound_link")
-        self.assertEqual(meta["version"], "0.3.2")
-        self.assertEqual(set(meta["params"]), set(PARAM_DEFS))
-        self.assertEqual(set(meta["params"]),
-                         {"left_loudness", "right_loudness",
-                          "left_frequency", "right_frequency",
-                          "left_pulse", "right_pulse"})
+        self.assertEqual(meta["version"], "0.4.0")
         cfg = meta["config"]
-        self.assertIn("microphone", cfg)
-        self.assertIn("speaker", cfg)
-        self.assertIn("swap_channels", cfg)
-        self.assertNotIn("device", cfg)
-        self.assertNotIn("mappings", cfg)
-        self.assertNotIn("outputs", cfg)
+        self.assertEqual(set(cfg), {"mic_enabled", "microphone", "mic_pulse",
+                                    "mic_mappings", "loop_enabled", "speaker",
+                                    "loop_pulse", "loop_mappings",
+                                    "swap_channels", "gain", "min_db",
+                                    "max_db", "smooth", "min_hz", "max_hz"})
+        self.assertNotIn("source", cfg)
+        self.assertFalse(cfg["loop_enabled"]["default"])
+        self.assertTrue(cfg["mic_enabled"]["default"])
+        self.assertEqual(cfg["mic_pulse"]["default"], "ab")
+        self.assertEqual(cfg["loop_pulse"]["default"], "off")
+
+    def test_params_follow_param_defs(self):
+        self.assertEqual(set(META["params"]), set(PARAM_DEFS))
+
+    def test_link_and_temp_specs_list_eight_readable_vars(self):
+        module = SoundLinkModule()
+        names = [name for name, _label in module.link_params()]
+        self.assertEqual(names, list(PARAM_DEFS))
+        specs = {spec["key"]: spec for spec in module.temp_specs()}
+        self.assertEqual(set(specs), set(PARAM_DEFS))
+        self.assertTrue(all(spec["dir"] == "in" for spec in specs.values()))
 
     def test_config_spec_scans_devices_into_choices(self):
         from modules.sound_link import bridge as bridge_mod
@@ -268,34 +366,15 @@ class PluginContractTests(unittest.TestCase):
             bridge_mod.list_microphones = orig_mic
             bridge_mod.list_speakers = orig_spk
 
-    def test_bound_name_prefers_source_key_over_legacy(self):
-        bridge, _ = _bridge({"microphone": "阵列麦克风", "device": "旧值"})
-        self.assertEqual(bridge._bound_name(), "阵列麦克风")
-        bridge2, _ = _bridge({"source": "loopback", "speaker": "", "device": "旧值"})
-        self.assertEqual(bridge2._bound_name(), "旧值")
-
-    def test_link_params_returns_six_variables(self):
-        module = SoundLinkModule()
-        params = module.link_params()
-        self.assertEqual([name for name, _label in params],
-                         ["left_loudness", "right_loudness",
-                          "left_frequency", "right_frequency",
-                          "left_pulse", "right_pulse"])
-
-    def test_default_event_cards_target_core_inputs(self):
-        specs = input_specs()
-        for card in DEFAULT_EVENT_CARDS:
-            self.assertEqual(card["trigger"], "period")
-            self.assertEqual(card["arg"], 100)
-            for action in card["actions"]:
-                self.assertEqual(action["dir"], "in")
-                self.assertIn(action["param"], specs)
-                self.assertEqual(specs[action["param"]]["action"], "pulse")
-                self.assertIn(action["var"], PARAM_DEFS)
-
-    def test_on_load_seeds_default_events_once(self):
+    def test_on_load_migrates_and_drops_legacy_events(self):
         module = SoundLinkModule()
         logs: list[str] = []
+
+        class FakeSettings(dict):
+            saved = 0
+
+            def save(self):
+                FakeSettings.saved += 1
 
         class FakeCtx:
             engine = None
@@ -304,15 +383,13 @@ class PluginContractTests(unittest.TestCase):
                 logs.append(msg)
 
         ctx = FakeCtx()
-        ctx.settings = {}
+        ctx.settings = FakeSettings(source="loopback",
+                                    events=[{"name": "旧事件卡"}])
         module.on_load(ctx)
-        self.assertIn("events", ctx.settings)
-        self.assertEqual(len(ctx.settings["events"]), 1)
-        self.assertEqual(ctx.settings["events"][0]["name"], "音频脉冲流推入")
-        self.assertTrue(logs)
-        ctx.settings["events"] = [{"name": "自定义"}]
-        module.on_load(ctx)
-        self.assertEqual(ctx.settings["events"], [{"name": "自定义"}])
+        self.assertNotIn("source", ctx.settings)
+        self.assertTrue(ctx.settings["loop_enabled"])
+        self.assertNotIn("events", ctx.settings)
+        self.assertGreaterEqual(FakeSettings.saved, 1)
 
     def test_module_class_attributes(self):
         module = SoundLinkModule()
@@ -320,6 +397,11 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(module.settings_key, "sound_link")
         self.assertFalse(module.is_running())
         self.assertTrue(callable(module.config_spec))
+
+    def test_device_names_are_per_source(self):
+        bridge, _ = _bridge({"microphone": "阵列麦克风", "speaker": "扬声器"})
+        self.assertEqual(bridge.sources["mic"].device_name(), "阵列麦克风")
+        self.assertEqual(bridge.sources["loop"].device_name(), "扬声器")
 
 
 if __name__ == "__main__":
