@@ -1,10 +1,12 @@
 META = {
     "id": "sound_link",
     "name": "音频联动",
-    "version": "0.4.1",
-    "description": "纯输入联动：麦克风与系统声音（WASAPI 回环）双路同时监听，"
-                   "每路各输出左右响度 / 左右频率八个映射变量、各维护一张映射表；"
-                   "频率值直接推入核心「外部脉冲流」参数（0.1s 一拍），输出频率跟随声音音高。",
+    "version": "0.5.0",
+    "description": "纯输入采集：麦克风与系统声音（WASAPI 回环）双路同时监听，"
+                   "每路各输出左右响度 / 左右频率八个只读变量。模块只采集与登记"
+                   "变量、绝不直接驱动设备；脉冲流推入与设备动作一律在「事件流」页"
+                   "用写入卡（如范围映射卡把频率变量映射到核心「外部脉冲流频率」）"
+                   "完成，由用户自行连线。",
     "settings_key": "sound_link",
     "default_enabled": False,
     "params": {},
@@ -20,43 +22,16 @@ META = {
             "desc": "设备名由模块自动扫描枚举（模块页为下拉选择框）；"
                     "留空用系统默认录音设备",
         },
-        "mic_pulse": {
-            "label": "麦克风 → 脉冲流", "type": "choice",
-            "choices": ["off", "ab", "a", "b"],
-            "labels": ["不推流", "左→A · 右→B", "仅左→A", "仅右→B"],
-            "default": "ab", "group": "audio",
-            "desc": "把麦克风左右声道的频率值按对数刻度推入核心「外部脉冲流」；"
-                    "静音时推 0（停止脉冲）",
-        },
-        "mic_mappings": {
-            "label": "麦克风映射表", "type": "list", "default": [],
-            "group": "map", "rows": "in",
-            "desc": "行 {param: 核心输入参数, expr: 表达式}，变量用 "
-                    "{mic_left_loudness} {mic_left_frequency} 等本路采集值，"
-                    "结果取整钳制后派发设备动作",
-        },
         "loop_enabled": {
             "label": "监听系统声音", "type": "bool", "default": False,
             "group": "audio",
             "desc": "Windows WASAPI 回环采集正在播放的声音；与麦克风互不影响，"
-                    "两路各自一张映射表（改动后重新开关模块生效）",
+                    "两路各输出八个变量中的四个（改动后重新开关模块生效）",
         },
         "speaker": {
             "label": "播放设备（回环）", "type": "str", "default": "",
             "group": "audio",
             "desc": "回环采集的播放设备（自动枚举）；留空用系统默认播放设备",
-        },
-        "loop_pulse": {
-            "label": "系统声音 → 脉冲流", "type": "choice",
-            "choices": ["off", "ab", "a", "b"],
-            "labels": ["不推流", "左→A · 右→B", "仅左→A", "仅右→B"],
-            "default": "off", "group": "audio",
-            "desc": "两路同时推同一通道会互相抢驱动，通常只开一路推流",
-        },
-        "loop_mappings": {
-            "label": "系统声音映射表", "type": "list", "default": [],
-            "group": "map", "rows": "in",
-            "desc": "变量用 {loop_left_loudness} {loop_left_frequency} 等本路采集值",
         },
         "swap_channels": {
             "label": "左右声道交换", "type": "bool", "default": False,
@@ -138,8 +113,11 @@ class SoundLinkModule(ModuleBase):
             spec[key] = item
         return spec
 
-    def link_params(self) -> list[tuple[str, str]]:
-        return [(name, str(item.get("label") or ""))
+    def link_params(self) -> list[dict]:
+        """八个采集变量：显式声明为只读（dir=in）、浮点（type=Float）。"""
+        return [{"name": name, "label": str(item.get("label") or ""),
+                 "dir": "in", "type": "Float",
+                 "desc": str(item.get("desc") or "")}
                 for name, item in PARAM_DEFS.items()]
 
     def temp_specs(self) -> list[dict]:
@@ -153,7 +131,7 @@ class SoundLinkModule(ModuleBase):
         self.ctx = ctx
         if migrate_settings(ctx.settings, ctx.log) and hasattr(ctx.settings, "save"):
             ctx.settings.save()
-        ctx.settings.pop("events", None)   # 推流改由模块直接驱动，不再播种事件卡
+        ctx.settings.pop("events", None)   # 清掉历史遗留的事件卡播种字段
 
     def on_unload(self) -> None:
         if self.bridge is not None:
@@ -184,7 +162,6 @@ class SoundLinkModule(ModuleBase):
         for key in SOUND_CONFIG_DEFAULTS:
             if key in self.ctx.settings:
                 self.bridge.config[key] = self.ctx.settings[key]
-        self.bridge.apply_config()
 
     async def stop(self) -> None:
         if self.bridge is not None:

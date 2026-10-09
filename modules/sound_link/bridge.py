@@ -9,12 +9,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from dglab.mapping import MappingEngine
-from dglab.params import (build_dispatchers, core_alias_values, core_inputs,
-                          device_state_values, input_ranges)
-from dglab.state import family_of
-
-__all__ = ["SoundBridge", "SoundConfig", "DEVICES", "PARAM_DEFS", "PULSE_MODES",
+__all__ = ["SoundBridge", "SoundConfig", "DEVICES", "PARAM_DEFS",
            "list_microphones", "list_speakers", "migrate_settings",
            "rms_dbfs", "dbfs_to_level", "dominant_frequency", "hz_to_logical"]
 
@@ -24,15 +19,6 @@ SILENCE_LEVEL = 1.0
 
 DEVICES: tuple[tuple[str, str], ...] = (("mic", "麦克风"), ("loop", "系统声音"))
 SIDES: tuple[tuple[str, str], ...] = (("left", "左"), ("right", "右"))
-
-PULSE_MODES = {"off": "不推流", "ab": "左→A · 右→B", "a": "仅左→A",
-               "b": "仅右→B"}
-_PULSE_CHANNELS = {
-    "off": {},
-    "ab": {"left": "A", "right": "B"},
-    "a": {"left": "A"},
-    "b": {"right": "B"},
-}
 
 PARAM_DEFS: dict[str, dict[str, str]] = {}
 for _dev_key, _dev_label in DEVICES:
@@ -45,25 +31,37 @@ for _dev_key, _dev_label in DEVICES:
             "desc": f"{_dev_label}{_side_label}声道主频率 (Hz)"}
 
 
-def migrate_settings(settings, log=None) -> bool:
-    """旧版「单一声音来源」配置迁移为双设备开关。
+REMOVED_DEVICE_KEYS = ("mic_pulse", "loop_pulse", "mic_mappings", "loop_mappings")
 
-    source=loopback 的用途户升级后仍然只监听系统声音（麦克风那一路关掉），
-    避免两路同时推流互相抢通道。
+
+def migrate_settings(settings, log=None) -> bool:
+    """把历史配置迁移到「纯输入」形态。
+
+    1. 旧版「单一声音来源」（source=loopback/microphone）迁移为双设备开关：
+       选 loopback 的用户升级后仍只监听系统声音（麦克风那一路关掉）。
+    2. 模块不再直写设备：脉冲流推入（*_pulse）与映射表（*_mappings）配置项
+       已从配置清除，改由「事件流」页面用写入卡片驱动。
     """
-    if "source" not in settings:
-        return False
-    source = str(settings.pop("source") or "microphone")
-    loopback = source == "loopback"
-    settings["mic_enabled"] = not loopback
-    settings["loop_enabled"] = loopback
-    settings["mic_pulse"] = "off" if loopback else str(
-        settings.get("mic_pulse") or "ab")
-    settings["loop_pulse"] = "ab" if loopback else str(
-        settings.get("loop_pulse") or "off")
-    if log is not None:
-        log("音频联动：已把「声音来源」设置迁移为麦克风 / 系统声音双开关")
-    return True
+    changed = False
+    if "source" in settings:
+        source = str(settings.pop("source") or "microphone")
+        loopback = source == "loopback"
+        settings["mic_enabled"] = not loopback
+        settings["loop_enabled"] = loopback
+        if log is not None:
+            log("音频联动：已把「声音来源」设置迁移为麦克风 / 系统声音双开关")
+        changed = True
+    dropped = False
+    for key in REMOVED_DEVICE_KEYS:
+        if key in settings:
+            settings.pop(key)
+            dropped = True
+    if dropped:
+        changed = True
+        if log is not None:
+            log("音频联动：脉冲流推入与映射表已改由「事件流」页面用写入卡片驱动，"
+                "模块不再直写设备，已清除相应旧配置项")
+    return changed
 
 
 class SoundConfig(dict):
@@ -71,12 +69,8 @@ class SoundConfig(dict):
     DEFAULTS = {
         "mic_enabled": True,
         "microphone": "",
-        "mic_pulse": "ab",
-        "mic_mappings": [],
         "loop_enabled": False,
         "speaker": "",
-        "loop_pulse": "off",
-        "loop_mappings": [],
         "swap_channels": False,
         "gain": 1.0,
         "min_db": -60.0,
@@ -190,6 +184,9 @@ def dominant_frequency(window: np.ndarray, samplerate: float,
 
 
 def hz_to_logical(hz: float, low_hz: float, high_hz: float) -> int:
+    # 声音频率 → 设备逻辑频率 10-1000（min_hz→10、max_hz→1000，对数刻度）。
+    # 模块不再用它直推核心：这段换算现由「事件流」里的范围映射 / 公式卡对
+    # {…_frequency} 变量完成。保留导出供测试与 README 引用。
     lo = max(1.0, float(low_hz))
     hi = max(lo * 2.0, float(high_hz))
     hz = min(max(float(hz), lo), hi)
@@ -197,8 +194,14 @@ def hz_to_logical(hz: float, low_hz: float, high_hz: float) -> int:
     return 10 + int(round(t * 990))
 
 
-class _EngineGroup:
-    """两路采集各持一张映射表；对核心只暴露合并后的信号视图。"""
+class _SignalHub:
+    """两路采集各持一个信号字典；对核心只暴露合并后的只读信号视图。
+
+    核心 `plugins._mapping_engine` 与 `flow_host.module_signals` 只认「一个
+    engine」对象，需要 `.signals`（事件流变量表读数）与 `.errors`；`.pump()`
+    仅为兼容宿主 set_temp/apply_logic_tables 的调用点而保留的空操作。本模块
+    不再做任何设备派发，频率→设备频率的换算改在事件流里用范围映射卡完成。
+    """
 
     def __init__(self, sources: dict[str, "_Source"]):
         self._sources = sources
@@ -207,24 +210,19 @@ class _EngineGroup:
     def signals(self) -> dict[str, float]:
         out: dict[str, float] = {}
         for source in self._sources.values():
-            out.update(source.engine.signals)
+            out.update(source.signals)
         return out
 
     @property
     def errors(self) -> dict[str, str]:
-        out: dict[str, str] = {}
-        for key, source in self._sources.items():
-            out.update({f"{key}:{name}": text for name, text
-                        in source.engine.errors.items()})
-        return out
+        return {}
 
     def pump(self) -> None:
-        for source in self._sources.values():
-            source.engine.pump()
+        return None
 
 
 class _Source:
-    """一路声音采集：设备句柄、采样块、平滑状态与自己的映射表。"""
+    """一路声音采集：设备句柄、采样块、平滑状态与本路信号字典。"""
 
     def __init__(self, key: str, label: str, bridge: "SoundBridge"):
         self.key = key
@@ -240,9 +238,7 @@ class _Source:
         self.channels = 2
         self.smoothed: dict[str, float] = {}
         self.last_freq: dict[str, float] = {"left": 0.0, "right": 0.0}
-        self.engine = MappingEngine(bridge._dispatch,
-                                    device_vars=bridge._device_vars,
-                                    ranges=input_ranges())
+        self.signals: dict[str, float] = {}
 
     @property
     def config(self) -> dict:
@@ -254,9 +250,6 @@ class _Source:
     def device_name(self) -> str:
         key = "speaker" if self.key == "loop" else "microphone"
         return str(self.config.get(key) or "").strip()
-
-    def pulse_mode(self) -> str:
-        return str(self.config.get(f"{self.key}_pulse") or "off")
 
     def signature(self) -> tuple:
         return (self.is_enabled(), self.device_name())
@@ -344,13 +337,12 @@ class _Source:
     def _log_bound(self, device_name: str) -> None:
         swap = bool(self.config.get("swap_channels"))
         lcol, rcol = (1, 0) if swap else (0, 1)
-        mode = PULSE_MODES.get(self.pulse_mode(), self.pulse_mode())
         self.bridge.log(
             f"{self.label}采集已打开: {device_name} "
             f"({self.samplerate:.0f} Hz × {self.channels} 声道)\n"
             f"声道绑定: 采集声道{lcol} → {self.key}_left_*，声道{rcol} → "
-            f"{self.key}_right_*；频率驱动脉冲流：{mode}"
-            f"（左右接反时开启「左右声道交换」对调）")
+            f"{self.key}_right_*（频率/响度只登记为只读变量，设备动作请在"
+            f"「事件流」里用写入卡片驱动；左右接反时开启「左右声道交换」对调）")
 
     def _open_microphone(self) -> None:
         import sounddevice as sd
@@ -448,8 +440,8 @@ class _Source:
 
 class SoundBridge:
 
-    def __init__(self, config: SoundConfig, get_state: Callable[[], Any],
-                 commands: Any, events=None):
+    def __init__(self, config: SoundConfig, get_state: Callable[[], Any] = None,
+                 commands: Any = None, events=None):
         self.config = config
         self.get_state = get_state
         self.commands = commands
@@ -457,129 +449,22 @@ class SoundBridge:
 
         self.log: Callable[[str], None] = print
         self._running = False
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._task: asyncio.Task | None = None
         self.last_values: dict[str, float] = {}
-        self._pulse_owner: dict[str, str] = {}
 
         self.sources = {key: _Source(key, label, self)
                         for key, label in DEVICES}
-        self.engine = _EngineGroup(self.sources)
-        self._api = self._DeviceApi(self)
-        self.dispatchers = build_dispatchers(self._api, core_inputs())
-        self.apply_config()
-
-    # ---------------------------------------------------------------- 配置
-    def apply_config(self) -> None:
-        for key, source in self.sources.items():
-            source.engine.set_mappings(self.config.get(f"{key}_mappings") or [])
-
-    def _safe_state(self):
-        try:
-            return self.get_state()
-        except Exception:
-            return None
-
-    def _device_vars(self) -> dict[str, float]:
-        vals = device_state_values(self._safe_state())
-        vals.update(core_alias_values(vals))
-        return vals
-
-    def _dispatch(self, target: str, value: int) -> None:
-        runner = self.dispatchers.get(target)
-        if runner is None:
-            return
-        try:
-            runner(value)
-        except Exception as exc:
-            self.log(f"映射派发 {target}={value} 失败: {exc!r}")
-
-    class _DeviceApi:
-
-        def __init__(self, bridge: "SoundBridge"):
-            self._b = bridge
-
-        @property
-        def _cmd(self):
-            return self._b.commands
-
-        def resolve_slot(self, family: str = "") -> str | None:
-            state = self._b._safe_state()
-            if state is None:
-                return None
-            slots = {sid: state.slots[sid] for sid in sorted(state.slots)}
-            if family:
-                for sid, slot in slots.items():
-                    if family_of(slot.type) == family:
-                        return sid
-                return None
-            for sid, slot in slots.items():
-                if family_of(slot.type) != "BMTR":
-                    return sid
-            return next(iter(slots), None)
-
-        def slot_family(self, sid: str) -> str:
-            state = self._b._safe_state()
-            if state is None or not sid:
-                return ""
-            slot = state.slots.get(sid)
-            return family_of(slot.type) if slot is not None else ""
-
-        def wave_order(self, family: str = "") -> list[str]:
-            from dglab.waves import wave_order
-            return wave_order(family or "COYOTE")
-
-        def wave_selection(self) -> dict:
-            getter = getattr(self._cmd, "wave_selection", None)
-            return (getter() or {}) if getter is not None else {}
-
-        def set_strength(self, channel, value, slot_id=None):
-            return self._cmd.set_strength(channel, value, slot_id=slot_id)
-
-        def set_wave(self, channel, name, slot_id=None):
-            return self._cmd.set_wave(channel, name, slot_id=slot_id)
-
-        def push_pulse(self, channel, value, level=100, slot_id=None):
-            return self._cmd.push_pulse_stream(value, channel=channel,
-                                               level=level, slot_id=slot_id)
-
-        def pulse_level(self, channel: str) -> int:
-            """脉冲流强度跟随响度：取当前推该通道的那一路采集的平滑响度。"""
-            key = self._b._pulse_owner.get(str(channel))
-            source = self._b.sources.get(key) if key else None
-            if source is None:
-                return 100
-            side = "left" if channel == "A" else "right"
-            level = source.smoothed.get(side, 0.0)
-            return max(0, min(100, int(round(level))))
-
-        def zap(self, channel, seconds=1.0, slot_id=None):
-            return self._cmd.zap(channel, seconds, slot_id=slot_id)
-
-        def fire_start(self, slot_id=None, channel=None):
-            return self._cmd.fire_start(slot_id=slot_id, channel=channel)
-
-        def fire_stop(self, slot_id=None, channel=None):
-            return self._cmd.fire_stop(slot_id=slot_id, channel=channel)
-
-        def emergency_stop(self):
-            return self._cmd.emergency_stop()
-
-        def run(self, coro) -> None:
-            self._b._spawn(coro)
+        self.engine = _SignalHub(self.sources)
 
     # ---------------------------------------------------------------- 生命周期
     async def start(self) -> None:
         if self._running:
             return
         self._running = True
-        self._loop = asyncio.get_running_loop()
-        self.apply_config()
         for source in self.sources.values():
             source.ensure()
         self._task = asyncio.create_task(self._tick_loop())
-        self.log("音频联动已启动（每 0.1s 一拍：双路采集各自分析响度 / 频率并"
-                 "按本路映射表派发；频率值直接推入「外部脉冲流」）")
+        self.log("音频联动已启动（每 0.1s 一拍：双路采集各自分析响度 / 频率，"
+                 "结果登记为八个只读变量；设备动作由「事件流」写入卡驱动）")
 
     async def stop(self) -> None:
         self._running = False
@@ -592,20 +477,6 @@ class SoundBridge:
 
     def close(self) -> None:
         pass
-
-    def _spawn(self, coro) -> None:
-        loop = self._loop
-        if loop is None or loop.is_closed():
-            coro.close()
-            return
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is loop:
-            loop.create_task(coro)
-        else:
-            asyncio.run_coroutine_threadsafe(coro, loop)
 
     def _log_error(self, prefix: str) -> None:
         self.log(f"{prefix}:\n{traceback.format_exc()}")
@@ -635,8 +506,8 @@ class SoundBridge:
         for source in self.sources.values():
             if not source.ensure():
                 for side, _label in SIDES:
-                    source.engine.signal(f"{source.key}_{side}_loudness", 0.0)
-                    source.engine.signal(f"{source.key}_{side}_frequency", 0.0)
+                    source.signals[f"{source.key}_{side}_loudness"] = 0.0
+                    source.signals[f"{source.key}_{side}_frequency"] = 0.0
                 continue
             window = source.take_window()
             for side, audio_col in (("left", 1 if swap else 0),
@@ -644,11 +515,8 @@ class SoundBridge:
                 level, freq = self._measure(
                     source, side, window, audio_col, gain_db, min_db, max_db,
                     smooth, low_hz, high_hz)
-                source.engine.signal(f"{source.key}_{side}_loudness",
-                                     round(level, 1))
-                source.engine.signal(f"{source.key}_{side}_frequency",
-                                     round(freq, 1))
-                self._push_pulse(source, side, level, freq, low_hz, high_hz)
+                source.signals[f"{source.key}_{side}_loudness"] = round(level, 1)
+                source.signals[f"{source.key}_{side}_frequency"] = round(freq, 1)
 
         self.last_values = dict(self.engine.signals)
 
@@ -671,20 +539,3 @@ class SoundBridge:
             source.last_freq[side] = freq
             return level, freq
         return level, source.last_freq.get(side, 0.0)
-
-    def _push_pulse(self, source: _Source, side: str, level: float,
-                    freq: float, low_hz: float, high_hz: float) -> None:
-        """频率值直接驱动推流：走核心 in_pulse_* 的既有派发逻辑（0.1s 节流）。"""
-        channel = _PULSE_CHANNELS.get(source.pulse_mode(), {}).get(side)
-        if not channel:
-            return
-        value = hz_to_logical(freq, low_hz, high_hz) \
-            if (freq > 0.0 and level >= SILENCE_LEVEL) else 0
-        self._pulse_owner[channel] = source.key
-        runner = self.dispatchers.get(f"in_pulse_{channel.lower()}")
-        if runner is None:
-            return
-        try:
-            runner(int(value))
-        except Exception as exc:
-            self.log(f"{source.label} 脉冲流推入失败: {exc!r}")
