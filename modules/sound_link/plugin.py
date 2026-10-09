@@ -1,7 +1,7 @@
 META = {
     "id": "sound_link",
     "name": "音频联动",
-    "version": "0.4.0",
+    "version": "0.4.1",
     "description": "纯输入联动：麦克风与系统声音（WASAPI 回环）双路同时监听，"
                    "每路各输出左右响度 / 左右频率八个映射变量、各维护一张映射表；"
                    "频率值直接推入核心「外部脉冲流」参数（0.1s 一拍），输出频率跟随声音音高。",
@@ -145,7 +145,8 @@ class SoundLinkModule(ModuleBase):
     def temp_specs(self) -> list[dict]:
         """采集值由本模块每拍维护：只读，回传方向没有意义。"""
         return [{"key": name, "label": str(item.get("label") or ""),
-                 "dir": "in", "desc": str(item.get("desc") or "")}
+                 "dir": "in", "type": "Float",
+                 "desc": str(item.get("desc") or "")}
                 for name, item in PARAM_DEFS.items()]
 
     def on_load(self, ctx) -> None:

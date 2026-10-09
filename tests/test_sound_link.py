@@ -317,7 +317,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "sound_link")
         self.assertEqual(meta["settings_key"], "sound_link")
-        self.assertEqual(meta["version"], "0.4.0")
+        self.assertEqual(meta["version"], "0.4.1")
         cfg = meta["config"]
         self.assertEqual(set(cfg), {"mic_enabled", "microphone", "mic_pulse",
                                     "mic_mappings", "loop_enabled", "speaker",
@@ -340,6 +340,8 @@ class PluginContractTests(unittest.TestCase):
         specs = {spec["key"]: spec for spec in module.temp_specs()}
         self.assertEqual(set(specs), set(PARAM_DEFS))
         self.assertTrue(all(spec["dir"] == "in" for spec in specs.values()))
+        self.assertTrue(all(spec["type"] == "Float"
+                            for spec in specs.values()))
 
     def test_config_spec_scans_devices_into_choices(self):
         from modules.sound_link import bridge as bridge_mod
