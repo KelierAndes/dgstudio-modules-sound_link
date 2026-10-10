@@ -316,7 +316,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "sound_link")
         self.assertEqual(meta["settings_key"], "sound_link")
-        self.assertEqual(meta["version"], "0.5.0")
+        self.assertEqual(meta["version"], "0.5.1")
         cfg = meta["config"]
         self.assertEqual(set(cfg), {"mic_enabled", "microphone", "loop_enabled",
                                     "speaker", "swap_channels", "gain", "min_db",

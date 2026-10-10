@@ -34,6 +34,11 @@ DGStudio 的音频联动模块：**麦克风**与**系统正在播放的声音**
 
 DGStudio「模块」页 → 在线列表找到「音频联动」→ 安装并启动（依赖自动补装）。
 
+依赖 `numpy` / `sounddevice` / `pyaudiowpatch` 随仓库 `modules/sound_link/wheels/`
+离线分发，装模块时由宿主解进 `modules/sound_link/_deps/`，不必联网。自带 wheel
+**必须与 DGStudio 内置 Python 的 ABI 一致**（当前 `cp314`；纯 Python 与 `abi3`
+不限），否则打包版会退化成联网安装，网络不通就装不上。
+
 ## 配置与使用
 
 1. 模块页「音频联动」卡片里勾选要监听的两路（麦克风 / 系统声音）并各选设备。
