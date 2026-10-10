@@ -1,0 +1,407 @@
+{
+  "version": 3,
+  "name": "SoundLink",
+  "saved_at": "2026-10-11 01:41:15",
+  "graphs": {
+    "input": {
+      "page": "input",
+      "nodes": [
+        {
+          "id": "i152",
+          "def": "mod.period",
+          "x": 576.43359375,
+          "y": 40.0,
+          "params": {
+            "period_ms": 50,
+            "var": ""
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i153",
+          "def": "mod.read.sound_link.loop_left_frequency",
+          "x": 310.51953125,
+          "y": 502.0,
+          "params": {
+            "module": "sound_link",
+            "name": "loop_left_frequency"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i154",
+          "def": "mod.read.sound_link.loop_left_loudness",
+          "x": 310.51953125,
+          "y": 348.0,
+          "params": {
+            "module": "sound_link",
+            "name": "loop_left_loudness"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i155",
+          "def": "mod.read.sound_link.loop_right_frequency",
+          "x": 310.51953125,
+          "y": 579.0,
+          "params": {
+            "module": "sound_link",
+            "name": "loop_right_frequency"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i156",
+          "def": "mod.read.sound_link.loop_right_loudness",
+          "x": 310.51953125,
+          "y": 425.0,
+          "params": {
+            "module": "sound_link",
+            "name": "loop_right_loudness"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i157",
+          "def": "mod.read.sound_link.mic_left_frequency",
+          "x": 310.51953125,
+          "y": 194.0,
+          "params": {
+            "module": "sound_link",
+            "name": "mic_left_frequency"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i158",
+          "def": "mod.read.sound_link.mic_left_loudness",
+          "x": 310.51953125,
+          "y": 40.0,
+          "params": {
+            "module": "sound_link",
+            "name": "mic_left_loudness"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i159",
+          "def": "mod.read.sound_link.mic_right_frequency",
+          "x": 310.51953125,
+          "y": 271.0,
+          "params": {
+            "module": "sound_link",
+            "name": "mic_right_frequency"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i160",
+          "def": "mod.read.sound_link.mic_right_loudness",
+          "x": 310.51953125,
+          "y": 117.0,
+          "params": {
+            "module": "sound_link",
+            "name": "mic_right_loudness"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i161",
+          "def": "core.write.in_strength_a",
+          "x": 40.0,
+          "y": 40.0,
+          "params": {
+            "key": "in_strength_a"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i162",
+          "def": "core.write.in_strength_b",
+          "x": 40.0,
+          "y": 117.0,
+          "params": {
+            "key": "in_strength_b"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i163",
+          "def": "core.write.in_ovc_strength_a",
+          "x": 40.0,
+          "y": 348.0,
+          "params": {
+            "key": "in_ovc_strength_a"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i164",
+          "def": "core.write.in_ovc_strength_b",
+          "x": 40.0,
+          "y": 425.0,
+          "params": {
+            "key": "in_ovc_strength_b"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i165",
+          "def": "core.write.in_pulse_a",
+          "x": 40.0,
+          "y": 194.0,
+          "params": {
+            "key": "in_pulse_a"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i166",
+          "def": "core.write.in_pulse_b",
+          "x": 40.0,
+          "y": 271.0,
+          "params": {
+            "key": "in_pulse_b"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i167",
+          "def": "core.write.in_ovc_pulse_a",
+          "x": 40.0,
+          "y": 502.0,
+          "params": {
+            "key": "in_ovc_pulse_a"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i168",
+          "def": "core.write.in_ovc_pulse_b",
+          "x": 40.0,
+          "y": 579.0,
+          "params": {
+            "key": "in_ovc_pulse_b"
+          },
+          "alias": "",
+          "overrides": {}
+        }
+      ],
+      "wires": [
+        {
+          "id": "iw169",
+          "src": [
+            "i152",
+            0
+          ],
+          "dst": [
+            "i161",
+            -1
+          ],
+          "type": "exec"
+        },
+        {
+          "id": "iw170",
+          "src": [
+            "i152",
+            0
+          ],
+          "dst": [
+            "i162",
+            -1
+          ],
+          "type": "exec"
+        },
+        {
+          "id": "iw171",
+          "src": [
+            "i152",
+            0
+          ],
+          "dst": [
+            "i165",
+            -1
+          ],
+          "type": "exec"
+        },
+        {
+          "id": "iw172",
+          "src": [
+            "i152",
+            0
+          ],
+          "dst": [
+            "i166",
+            -1
+          ],
+          "type": "exec"
+        },
+        {
+          "id": "iw173",
+          "src": [
+            "i152",
+            0
+          ],
+          "dst": [
+            "i163",
+            -1
+          ],
+          "type": "exec"
+        },
+        {
+          "id": "iw174",
+          "src": [
+            "i152",
+            0
+          ],
+          "dst": [
+            "i164",
+            -1
+          ],
+          "type": "exec"
+        },
+        {
+          "id": "iw175",
+          "src": [
+            "i152",
+            0
+          ],
+          "dst": [
+            "i167",
+            -1
+          ],
+          "type": "exec"
+        },
+        {
+          "id": "iw176",
+          "src": [
+            "i152",
+            0
+          ],
+          "dst": [
+            "i168",
+            -1
+          ],
+          "type": "exec"
+        },
+        {
+          "id": "iw185",
+          "src": [
+            "i158",
+            0
+          ],
+          "dst": [
+            "i161",
+            0
+          ],
+          "type": "float"
+        },
+        {
+          "id": "iw186",
+          "src": [
+            "i160",
+            0
+          ],
+          "dst": [
+            "i162",
+            0
+          ],
+          "type": "float"
+        },
+        {
+          "id": "iw187",
+          "src": [
+            "i157",
+            0
+          ],
+          "dst": [
+            "i165",
+            0
+          ],
+          "type": "float"
+        },
+        {
+          "id": "iw188",
+          "src": [
+            "i159",
+            0
+          ],
+          "dst": [
+            "i166",
+            0
+          ],
+          "type": "float"
+        },
+        {
+          "id": "iw189",
+          "src": [
+            "i154",
+            0
+          ],
+          "dst": [
+            "i163",
+            0
+          ],
+          "type": "float"
+        },
+        {
+          "id": "iw190",
+          "src": [
+            "i156",
+            0
+          ],
+          "dst": [
+            "i164",
+            0
+          ],
+          "type": "float"
+        },
+        {
+          "id": "iw191",
+          "src": [
+            "i153",
+            0
+          ],
+          "dst": [
+            "i167",
+            0
+          ],
+          "type": "float"
+        },
+        {
+          "id": "iw192",
+          "src": [
+            "i155",
+            0
+          ],
+          "dst": [
+            "i168",
+            0
+          ],
+          "type": "float"
+        }
+      ]
+    },
+    "output": {
+      "page": "output",
+      "nodes": [],
+      "wires": []
+    }
+  }
+}
