@@ -106,4 +106,5 @@ DGStudio「模块」页 → 在线列表找到「音频联动」→ 安装并启
 
 ## 许可
 
-本仓库以 **MIT License** 发布，全文见 [LICENSE](LICENSE)（`Copyright (c) 2026 KelierAndes`）。
+本仓库与 DGStudio 主仓库、其余模块仓库一致，以 **GNU General Public License
+v3.0**（GPL-3.0）发布，全文见 [LICENSE](LICENSE)。
